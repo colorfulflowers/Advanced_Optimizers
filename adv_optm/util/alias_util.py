@@ -9,15 +9,15 @@ def _update_alias_state(
     alias_d: torch.Tensor,
     alias_d_raw: torch.Tensor,
     alias_eta: torch.Tensor,
-    # State for memory efficient approx (approx_var=True)
+    # State for memory efficient approx (approx_alias=True)
     prev_grad_max: torch.Tensor | None,
     prev_grad_min: torch.Tensor | None,
-    # State for exact computation (approx_var=False)
+    # State for exact computation (approx_alias=False)
     prev_grad: torch.Tensor | None,
     # Common states
     prev_sign: torch.Tensor | None,
     prev_lr: torch.Tensor,
-    approx_var: bool,
+    approx_alias: bool,
     packed_sign: bool,
     original_shape: tuple | torch.Size,
 ) -> None:
@@ -43,7 +43,7 @@ def _update_alias_state(
     # Update Smoothness eta^t (Denominator)
     step_l1_norm = (prev_lr * numel).clamp_min_(1e-12)
 
-    if approx_var:
+    if approx_alias:
         # Memory-efficient ALIAS approximation
         current_grad_max = grad.max()
         current_grad_min = grad.min()

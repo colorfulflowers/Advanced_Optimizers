@@ -1,6 +1,7 @@
 import torch
 
 from typing import Optional
+import math
 
 from ..util import param_update
 from ..util.OrthoGrad import _orthogonalize_gradient
@@ -51,6 +52,11 @@ class SignSGD_adv(torch.optim.Optimizer):
             coordinates where the gradient sign flips compared to the previous step. (default: False)
         l1_adaptive (bool): Scales the update step magnitude dynamically
             by the mean L1 norm of the momentum/gradient to handle gradient heterogeneity.(default: False)
+        use_alias (bool): whether to use the ALIAS (Automatic Local per-Iteration
+            Approximation of the Stepsize) algorithm for parameter-free step size 
+            selection. (default: False)
+        alias_d0 (float): The initial distance approximation d^0 for ALIAS.
+            (default: 1e-3)
         centered_wd (float): Centered Weight Decay coefficient. Instead of decaying weights
             toward zero, they are decayed toward their initial values (anchors). This
             can be used together with standard weight decay. (default: 0.0)
@@ -85,6 +91,9 @@ class SignSGD_adv(torch.optim.Optimizer):
         # Projected and adaptive sign
         freeze_on_flip: bool = False,
         l1_adaptive: bool = False,
+        # ALIAS step size adaptation
+        use_alias: bool = True,
+        alias_d0: float = 1e-5,
         # Centered WD
         centered_wd: float = 0.0,
         centered_wd_mode: str = 'float8',
@@ -117,6 +126,8 @@ class SignSGD_adv(torch.optim.Optimizer):
             scaled_optm= scaled_optm,
             freeze_on_flip=freeze_on_flip,
             l1_adaptive=l1_adaptive,
+            use_alias=use_alias,
+            alias_d0=alias_d0,
             centered_wd= centered_wd,
             centered_wd_mode= centered_wd_mode,
             nnmf_factor=nnmf_factor,
@@ -168,6 +179,11 @@ class SignSGD_adv(torch.optim.Optimizer):
         grad = p.grad
         state = self.state[p]
 
+        lr = group["lr"]
+
+        if group.get('compiled_optimizer', False):
+            lr = torch.as_tensor(lr, dtype=torch.float64)
+
         # State Initialization
         if group["momentum"] > 0 and len(state) == 0:
             state['factored'] = (
@@ -195,12 +211,35 @@ class SignSGD_adv(torch.optim.Optimizer):
             if group.get('scaled_optm', False) and is_spectral(p):
                 init_spectral_norm(group, state, p)
 
-            if group.get("l1_adaptive", False):
+            if group.get("l1_adaptive", False) or group.get("use_alias", False):
                 state["step"] = 0
 
-            _init_anchor(p, state, group)
+            # ALIAS LR Calculation
+            if group.get('use_alias', False):
+                # Convert grad to float32 for stable math
+                g_max = grad.max().to(torch.float32)
+                g_min = grad.min().to(torch.float32)
 
-        lr = group["lr"]
+                if 'alias_d' not in state:
+                    state['alias_d'] = torch.tensor(group['alias_d0'], device=p.device, dtype=torch.float32)
+                    state['alias_tilde_d'] = torch.tensor(0.0, device=p.device, dtype=torch.float32)
+                    state['alias_eta'] = torch.tensor(0.0, device=p.device, dtype=torch.float32)
+                    state['alias_prev_grad_max'] = g_max.clone()
+                    state['alias_prev_grad_min'] = g_min.clone()
+                    state['alias_prev_update_l1'] = torch.tensor(0.0, device=p.device, dtype=torch.float32)
+
+                    if isinstance(lr, torch.Tensor):
+                        state['alias_prev_lr'] = lr.clone().to(torch.float32)
+                    else:
+                        state['alias_prev_lr'] = torch.tensor(lr, device=p.device, dtype=torch.float32)
+
+                    if state.get('factored'):
+                        state['alias_prev_sign_packed'] = torch.zeros((d1, packed_d2), dtype=torch.uint8, device=p.device)
+                    else:
+                        state['alias_prev_sign'] = torch.zeros_like(grad, dtype=torch.uint8)
+
+
+            _init_anchor(p, state, group)
 
         random_int_tensor = None
 
@@ -208,18 +247,17 @@ class SignSGD_adv(torch.optim.Optimizer):
             if p.dtype == torch.bfloat16 and self.stochastic_rounding:
                 # Pre-generate random tensor for stochastic rounding if needed.
                 random_int_tensor = param_update._get_random_int_for_sr(p)
-            lr = torch.as_tensor(lr, dtype=torch.float64)
             step_param_fn = self._compiled_step_parameter
         else:
             step_param_fn = self._step_parameter
 
         step_param_fn(p, grad, state, group, lr, random_int_tensor)
 
-        if group.get("l1_adaptive", False):
+        if group.get("l1_adaptive", False) or group.get("use_alias", False):
             state["step"] += 1
 
     def _step_parameter(self, p, grad, state, group, lr, random_int_tensor):
-        if grad.dtype != torch.float32 and state['factored']:
+        if grad.dtype != torch.float32 and state.get('factored', False):
             grad = grad.float()
 
         if group["orthogonal_gradient"]:
@@ -303,6 +341,48 @@ class SignSGD_adv(torch.optim.Optimizer):
                 update = torch.where(current_sign == state['prev_sign'], update, 0.0)
                 state['prev_sign'] = current_sign
 
+        # ALIAS LR Calculation
+        if group.get('use_alias', False):
+            # Convert grad to float32 for stable math
+            g_max = grad.max().to(torch.float32)
+            g_min = grad.min().to(torch.float32)
+
+            prev_l1 = state['alias_prev_update_l1']
+            safe_prev_l1 = torch.where(prev_l1 > 0, prev_l1, torch.ones_like(prev_l1))
+
+            approx_max_diff = torch.maximum((g_max - state['alias_prev_grad_min']).abs(),
+                                            (state['alias_prev_grad_max'] - g_min).abs())
+
+            eta_inc = torch.where(prev_l1 > 0, approx_max_diff / safe_prev_l1, torch.zeros_like(prev_l1))
+            state['alias_eta'].add_(eta_inc)
+
+            if state.get('factored'):
+                d1, d2 = state['effective_shape']
+                prev_sign_float = _unpack_bools(state['alias_prev_sign_packed'], original_m=d2).to(grad.dtype) * 2.0 - 1.0
+                dot_product = torch.mean(grad.view(d1, d2) * prev_sign_float).to(torch.float32)
+            else:
+                prev_sign_float = state['alias_prev_sign'].to(grad.dtype) * 2.0 - 1.0
+                dot_product = torch.mean(grad * prev_sign_float).to(torch.float32)
+
+            tilde_d_inc = state['alias_prev_lr'] * dot_product
+            tilde_d_inc = torch.where(prev_l1 > 0, tilde_d_inc, torch.zeros_like(tilde_d_inc))
+
+            state['alias_tilde_d'].add_(tilde_d_inc)
+            state['alias_d'].copy_(torch.maximum(state['alias_d'], state['alias_tilde_d']))
+
+            state['alias_prev_grad_max'].copy_(g_max)
+            state['alias_prev_grad_min'].copy_(g_min)
+
+            alias_lr = torch.sqrt(state['alias_d'] / state['alias_eta'])
+
+            if not isinstance(lr, torch.Tensor):
+                lr_t = torch.tensor(lr, dtype=torch.float32)
+            else:
+                lr_t = lr.to(torch.float32)
+
+            lr = torch.where(state['alias_eta'] > 0, alias_lr, lr_t)
+            state['alias_prev_lr'].copy_(lr)
+
         if l1_mean is not None:
             update.mul_(l1_mean)
 
@@ -310,6 +390,14 @@ class SignSGD_adv(torch.optim.Optimizer):
             update = scale_update(p, update, lr, vector_state=state.get('spectral_v'))
         else:
             update.mul_(lr)
+
+        if group.get('use_alias', False):
+            if state.get('factored'):
+                state['alias_prev_sign_packed'].copy_(_pack_bools(raw_update > 0))
+            else:
+                state['alias_prev_sign'].copy_((raw_update > 0).to(torch.uint8))
+
+            state['alias_prev_update_l1'].copy_(update.abs().mean().to(torch.float32))
 
         param_update.apply_parameter_update(self, p, group, update, lr, random_int_tensor=random_int_tensor)
 

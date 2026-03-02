@@ -30,7 +30,7 @@ class ALIAS_adv(torch.optim.Optimizer):
             rounding for BF16 parameter updates (default: True).
         packed_sign (bool): Always use 1-bit compress for uint8 sign to 
             save memory (default: True).
-        approx_var (bool): Controls the L_inf norm approximation logic for ALIAS.
+        approx_alias (bool): Controls the L_inf norm approximation logic for ALIAS.
             If True: Uses memory-efficient scalar tracking (max/min) to approximate
             the smoothness term.
             If False: Stores the full previous gradient to calculate exact
@@ -73,7 +73,7 @@ class ALIAS_adv(torch.optim.Optimizer):
         # Stochastic Rounding for BF16
         stochastic_rounding: bool = True,
         packed_sign: bool = True, 
-        approx_var: bool = False, 
+        approx_alias: bool = False, 
         # OrthoGrad
         orthogonal_gradient: bool = False,
         # Simplified_AdEMAMix
@@ -106,7 +106,7 @@ class ALIAS_adv(torch.optim.Optimizer):
             weight_decay=weight_decay,
             cautious_wd=cautious_wd,
             packed_sign=packed_sign,
-            approx_var=approx_var,
+            approx_alias=approx_alias,
             orthogonal_gradient=orthogonal_gradient,
             alpha_grad=alpha_grad,
             Simplified_AdEMAMix=Simplified_AdEMAMix,
@@ -205,8 +205,8 @@ class ALIAS_adv(torch.optim.Optimizer):
             state['alias_eta'] = torch.zeros(1, device=p.device, dtype=torch.float32)
             state['alias_prev_lr'] = torch.zeros(1, device=p.device, dtype=torch.float32)
 
-            # State allocation depends on approx_var setting
-            if group['approx_var']:
+            # State allocation depends on approx_alias setting
+            if group['approx_alias']:
                 state['alias_prev_grad_max'] = torch.zeros(1, device=p.device, dtype=torch.float32)
                 state['alias_prev_grad_min'] = torch.zeros(1, device=p.device, dtype=torch.float32)
             else:
@@ -264,7 +264,7 @@ class ALIAS_adv(torch.optim.Optimizer):
         alias_eta = state['alias_eta']
 
         # Select states based on approximation mode
-        if group['approx_var']:
+        if group['approx_alias']:
             prev_grad_max = state['alias_prev_grad_max']
             prev_grad_min = state['alias_prev_grad_min']
             prev_grad = None
@@ -286,7 +286,7 @@ class ALIAS_adv(torch.optim.Optimizer):
             prev_grad=prev_grad,
             prev_sign=prev_sign,
             prev_lr=prev_lr,
-            approx_var=group['approx_var'],
+            approx_alias=group['approx_alias'],
             packed_sign=group['packed_sign'],
             original_shape=p.shape
         )
@@ -365,7 +365,7 @@ class ALIAS_adv(torch.optim.Optimizer):
             state['alias_prev_sign'].copy_((update > 0).to(torch.uint8))
 
         # Dynamic Learning Rate Selection
-        lr_t = torch.tensor(group['lr'], dtype=torch.float32, device=p.device)
+        lr_t = torch.tensor(group['lr'], dtype=torch.float32)
         lr = torch.where(alias_eta > 0, alias_lr, lr_t).squeeze()
         state['alias_prev_lr'].copy_(lr)
 

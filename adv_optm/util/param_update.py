@@ -80,7 +80,6 @@ def apply_parameter_update(
     cwd = group.get("centered_wd", 0.0)
 
     if group.get('scaled_optm', False):
-        decoupled = True
         wd, cwd = scale_wds(wd, cwd, p)
 
     # Calculate global decay factor for decoupled vs standard

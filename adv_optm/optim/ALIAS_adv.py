@@ -288,7 +288,8 @@ class ALIAS_adv(torch.optim.Optimizer):
             prev_lr=prev_lr,
             approx_alias=group['approx_alias'],
             packed_sign=group['packed_sign'],
-            original_shape=p.shape
+            original_shape=p.shape,
+            step=step,
         )
 
         alias_lr = _get_alias_lr(alias_d, alias_eta, group['lr'])

@@ -10,7 +10,7 @@ from ..util.Kourkoutas import KourkoutasHelper
 from ..util.update_util import _grams_update, _cautious_update, _scale_sim_AdEMAMix_update
 from ..util.scaled_optm import scale_update, is_spectral, init_spectral_norm
 from ..util.centered_decay import _init_anchor
-from ..util.alias_util import init_alias_adam_state, update_alias_adam_distance
+from ..util.alias_util import init_alias_adam_state, get_alias_dot_product_and_update_sign, init_step_alias, calculate_alias_d
 
 A = 4 / math.pi
 
@@ -190,7 +190,7 @@ class Adopt_adv(torch.optim.Optimizer):
             "alpha_grad": alpha_grad,
             "kourkoutas_beta": kourkoutas_beta, "beta2_min": beta2_min, "ema_alpha": ema_alpha,
             "tiny_spike": tiny_spike, "k_warmup_steps": k_warmup_steps, "k_logging": k_logging,
-            "alias_adam": alias_adam, "d0": d0, 
+            "alias_adam": alias_adam, "d0": d0, "alias_d": d0, "alias_r": 0.0, 
             "scaled_optm": scaled_optm,
             "centered_wd": centered_wd,
             "centered_wd_mode": centered_wd_mode,
@@ -208,6 +208,7 @@ class Adopt_adv(torch.optim.Optimizer):
         self.kourkoutas_beta = kourkoutas_beta
         self.layer_key_fn = layer_key_fn
         self._init_lr = lr
+        self.fsdp_in_use = False
         super().__init__(params, defaults)
 
         if self.kourkoutas_beta:
@@ -223,6 +224,8 @@ class Adopt_adv(torch.optim.Optimizer):
         self._compiled_step_parameter = None
         if compiled_optimizer:
             self.compile(fullgraph=True)
+
+        init_step_alias(self)
 
     def load_state_dict(self, state_dict: dict) -> None:
         """
@@ -245,6 +248,9 @@ class Adopt_adv(torch.optim.Optimizer):
     def step_parameter(self, p: torch.Tensor, group: dict, i: int | None = None):
         if p.grad is None:
             return
+
+        if hasattr(p, "_fsdp_flattened"):
+            self.fsdp_in_use = True
 
         grad = p.grad
         state = self.state[p]
@@ -366,12 +372,12 @@ class Adopt_adv(torch.optim.Optimizer):
         factored_2nd = group.get('factored_2nd', False)
 
         # ALIAS Adam Distance Tracking
-        grad, d_t = update_alias_adam_distance(
-            grad, 
-            state, 
-            group, 
-            beta2,
-        )
+        if group.get('alias_adam', False):
+            dot_product = get_alias_dot_product_and_update_sign(grad, state, group)
+            if dot_product is not None:
+                self.alias_dot_product_sum.add_(dot_product)
+            d_t = group['alias_d']
+            grad = grad * d_t
 
         if state['factored']:
             d1, d2 = state['effective_shape']
@@ -508,7 +514,9 @@ class Adopt_adv(torch.optim.Optimizer):
                 vt.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
 
         update_scaling = lr * A if self.use_atan2 else lr
-        update_scaling = update_scaling * d_t
+
+        if group.get('alias_adam', False):
+            update_scaling = update_scaling * d_t
 
         if group.get('scaled_optm', False):
             update = scale_update(p, update, update_scaling, vector_state=state.get('spectral_v'))
@@ -533,4 +541,6 @@ class Adopt_adv(torch.optim.Optimizer):
             for i, p in enumerate(group['params']):
                 self.step_parameter(p, group, i)
 
+        calculate_alias_d(self)
+        init_step_alias(self)
         return loss

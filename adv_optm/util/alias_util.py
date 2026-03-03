@@ -1,3 +1,5 @@
+import torch.distributed as dist
+
 import torch
 import math
 
@@ -90,56 +92,91 @@ def _get_alias_lr(
         torch.tensor(base_lr, dtype=alias_d.dtype)
     )
 
-def init_alias_adam_state(p, state, group):
+def init_alias_adam_state(self, p, state, group):
     """
-    Initializes distance tracking and sign state for ALIAS Adam.
+    Initializes sign state for ALIAS Adam.
 
     Args:
         p (Tensor): The parameter tensor.
         state (dict): The state dictionary for the current parameter.
         group (dict): The optimizer parameter group containing configuration.
     """
-    device = p.device
+    if not group.get('alias_adam', False):
+        return
 
-    # Initialize distance tracking variables
-    state['alias_d'] = torch.full((1,), group['d0'], device=device, dtype=torch.float32)
-    state['alias_r'] = torch.full((1,), 0.0, device=device, dtype=torch.float32)
+    device = p.device
     n_elems = p.numel()
     # Calculate packed bytes: (n + 7) // 8
     packed_m = (n_elems + 7) // 8
-    state['alias_prev_sign'] = torch.zeros(packed_m, dtype=torch.uint8, device=device)
+    if 'alias_prev_sign' not in state:
+        state['alias_prev_sign'] = torch.zeros(packed_m, dtype=torch.uint8, device=device)
 
-def update_alias_adam_distance(grad, state, group, beta2):
+    if not hasattr(self, 'alias_dot_product_sum'):
+        self.alias_dot_product_sum = torch.tensor(0.0, device=p.device)
+
+def get_alias_dot_product_and_update_sign(grad, state, group):
     """
-    Updates the ALIAS Adam distance tracking and returns the scaled gradient.
+    Computes the ALIAS Adam dot product for the global tracking and updates the sign mask.
     """
     if not group.get('alias_adam', False):
-        return grad, 1
+        return None
 
-    d_t = state['alias_d']
-    r_t = state['alias_r']
     p_numel = grad.numel()
+    device = grad.device
 
     if state['step'] > 0:
         # Recover previous sign
         prev_sign_packed = state['alias_prev_sign'].view(1, -1)
         prev_sign = _unpack_bools(prev_sign_packed, p_numel).view_as(grad)
         prev_sign_f = torch.where(prev_sign, 1.0, -1.0).to(grad.dtype)
-        # Calculate alignment and update distance metrics
+        # Calculate alignment dot product
         dot_product = (grad * prev_sign_f).sum()
-        # Handle scalar or tensor beta2
-        if isinstance(beta2, torch.Tensor):
-            if beta2.dim() > 0:
-                beta2_sqrt = beta2.mean().sqrt()
-            else:
-                beta2_sqrt = beta2.sqrt()
-        else:
-            beta2_sqrt = math.sqrt(beta2)
-        r_t.mul_(beta2_sqrt).add_(d_t * dot_product, alpha=1.0 - beta2_sqrt)
-        d_t.copy_(torch.maximum(d_t, r_t))
+    else:
+        dot_product = torch.tensor(0.0, dtype=grad.dtype)
 
     current_sign_bool = (grad > 0).view(1, -1)
     state['alias_prev_sign'].copy_(_pack_bools(current_sign_bool).view(-1))
 
-    # Return the scaled gradient and the distance factor
-    return grad * d_t, d_t
+    return dot_product
+
+def init_step_alias(self):
+    """Resets accumulators for the upcoming step."""
+    if not self.param_groups[0].get('alias_adam', False):
+        return
+
+    if hasattr(self, 'alias_dot_product_sum'):
+        device = self.alias_dot_product_sum.device
+        self.alias_dot_product_sum = torch.tensor(0.0, device=device)
+
+def calculate_alias_d(self):
+    """Calculates the new global `alias_d` based on the accumulated stats."""
+    g_group = self.param_groups[0]
+    if not g_group.get('alias_adam', False):
+        return
+
+    # Handle sharded parameter gradients if applicable
+    if self.fsdp_in_use and dist.is_available() and dist.is_initialized():
+        dist.all_reduce(self.alias_dot_product_sum, op=dist.ReduceOp.SUM)
+
+    global_dot = self.alias_dot_product_sum.item()
+
+    beta2 = g_group['betas'][1]
+    # Handle cases where adaptive beta2 provides a tensor scalar
+    if isinstance(beta2, torch.Tensor):
+        if beta2.dim() > 0:
+            beta2_sqrt = beta2.mean().sqrt().item()
+        else:
+            beta2_sqrt = beta2.sqrt().item()
+    else:
+        beta2_sqrt = math.sqrt(beta2)
+
+    d_t = g_group['alias_d']
+    r_t = g_group['alias_r']
+
+    # Globally update running variables for next step
+    r_t = r_t * beta2_sqrt + (1.0 - beta2_sqrt) * d_t * global_dot
+    d_t = max(d_t, r_t)
+
+    for group in self.param_groups:
+        group['alias_d'] = d_t
+        group['alias_r'] = r_t

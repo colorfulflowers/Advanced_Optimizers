@@ -1,7 +1,7 @@
 import torch
 import math
 
-from .factorization_util import _unpack_bools
+from .factorization_util import _unpack_bools, _pack_bools
 
 @torch.no_grad()
 def _update_alias_state(
@@ -89,3 +89,57 @@ def _get_alias_lr(
         torch.sqrt(alias_d / alias_eta.clamp_min(1e-12)),
         torch.tensor(base_lr, dtype=alias_d.dtype)
     )
+
+def init_alias_adam_state(p, state, group):
+    """
+    Initializes distance tracking and sign state for ALIAS Adam.
+
+    Args:
+        p (Tensor): The parameter tensor.
+        state (dict): The state dictionary for the current parameter.
+        group (dict): The optimizer parameter group containing configuration.
+    """
+    device = p.device
+
+    # Initialize distance tracking variables
+    state['alias_d'] = torch.full((1,), group['d0'], device=device, dtype=torch.float32)
+    state['alias_r'] = torch.full((1,), 0.0, device=device, dtype=torch.float32)
+    n_elems = p.numel()
+    # Calculate packed bytes: (n + 7) // 8
+    packed_m = (n_elems + 7) // 8
+    state['alias_prev_sign'] = torch.zeros(packed_m, dtype=torch.uint8, device=device)
+
+def update_alias_adam_distance(grad, state, group, beta2):
+    """
+    Updates the ALIAS Adam distance tracking and returns the scaled gradient.
+    """
+    if not group.get('alias_adam', False):
+        return grad, 1
+
+    d_t = state['alias_d']
+    r_t = state['alias_r']
+    p_numel = grad.numel()
+
+    if state['step'] > 0:
+        # Recover previous sign
+        prev_sign_packed = state['alias_prev_sign'].view(1, -1)
+        prev_sign = _unpack_bools(prev_sign_packed, p_numel).view_as(grad)
+        prev_sign_f = torch.where(prev_sign, 1.0, -1.0).to(grad.dtype)
+        # Calculate alignment and update distance metrics
+        dot_product = (grad * prev_sign_f).sum()
+        # Handle scalar or tensor beta2
+        if isinstance(beta2, torch.Tensor):
+            if beta2.dim() > 0:
+                beta2_sqrt = beta2.mean().sqrt()
+            else:
+                beta2_sqrt = beta2.sqrt()
+        else:
+            beta2_sqrt = math.sqrt(beta2)
+        r_t.mul_(beta2_sqrt).add_(d_t * dot_product, alpha=1.0 - beta2_sqrt)
+        d_t.copy_(torch.maximum(d_t, r_t))
+
+    current_sign_bool = (grad > 0).view(1, -1)
+    state['alias_prev_sign'].copy_(_pack_bools(current_sign_bool).view(-1))
+
+    # Return the scaled gradient and the distance factor
+    return grad * d_t, d_t

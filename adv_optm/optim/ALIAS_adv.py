@@ -294,6 +294,10 @@ class ALIAS_adv(torch.optim.Optimizer):
 
         alias_lr = _get_alias_lr(alias_d, alias_eta, group['lr'])
 
+        if group['approx_alias']:
+            # Theorem 3.12 compensation for math in Eq 3
+            alias_lr *= p.numel()
+
         if state.get('factored'):
             # Factored Path
             d1, d2 = state['effective_shape']

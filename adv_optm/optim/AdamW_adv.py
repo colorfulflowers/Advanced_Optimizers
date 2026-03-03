@@ -11,6 +11,7 @@ from ..util.OrthoGrad import _orthogonalize_gradient
 from ..util.Kourkoutas import KourkoutasHelper
 from ..util.scaled_optm import scale_update, is_spectral, init_spectral_norm
 from ..util.centered_decay import _init_anchor
+from ..util.alias_util import init_alias_adam_state, update_alias_adam_distance
 
 A = 4 / math.pi
 
@@ -43,6 +44,7 @@ class AdamW_adv(torch.optim.Optimizer):
         grams_moment (bool): whether to use Grams-style updates. (default: False)
         cautious_mask (bool):  whether to use cautious masking to align the gradient's
             direction with the first moment's.  (default: False)
+        grams_moment (bool): whether to use Grams-style updates. (default: False)
         orthogonal_gradient (bool): whether to use OrthoGrad.  (default: False)
         use_AdEMAMix (bool): whether to enable the AdEMAMix feature. This adds
             a second, slow-moving average of the momentum (`mt_slow`) which is
@@ -92,7 +94,8 @@ class AdamW_adv(torch.optim.Optimizer):
         nnmf_factor (bool): whether to use the factorization or disable it to use
             the uncompressed optimizer. (default: False)
         factored_2nd (bool): whether to keep the first moment uncompressed (dense)
-            while only factorizing the second moment. (default: True)
+            while only factorizing the second moment. (default: False)
+        compiled_optimizer (bool): Initialize pre-compiled graph support. (default: False)
     """
 
     def __init__(
@@ -127,6 +130,9 @@ class AdamW_adv(torch.optim.Optimizer):
         k_warmup_steps: int = 0,
         k_logging: int = 0,
         layer_key_fn: Optional[Callable] = None,
+        # ALIAS (Parameter-Free tracking)
+        alias_adam: bool = False,
+        d0: float = 1e-3,
         # Scaled Optimizer
         scaled_optm: bool = False,
         # Centered WD
@@ -161,6 +167,7 @@ class AdamW_adv(torch.optim.Optimizer):
             "beta3_ema": beta3_ema, "alpha": alpha, "compiled_optimizer": compiled_optimizer,
             "kourkoutas_beta": kourkoutas_beta, "beta2_min": beta2_min, "ema_alpha": ema_alpha,
             "tiny_spike": tiny_spike, "k_warmup_steps": k_warmup_steps, "k_logging": k_logging,
+            "alias_adam": alias_adam, "d0": d0, 
             "scaled_optm": scaled_optm,
             "centered_wd": centered_wd, "centered_wd_mode": centered_wd_mode,
             "nnmf_factor": nnmf_factor, "vector_reshape": vector_reshape, "factored_2nd": factored_2nd
@@ -231,6 +238,9 @@ class AdamW_adv(torch.optim.Optimizer):
 
             dtype = torch.float32 if state['factored'] else p.dtype
             device = p.device
+
+            # Initialize ALIAS Adam distance tracking variables
+            init_alias_adam_state(p, state, group)
 
             if state['factored']:
                 state['effective_shape'] = _get_effective_shape(p.numel())
@@ -322,6 +332,14 @@ class AdamW_adv(torch.optim.Optimizer):
 
         # Determine if we are using dense first-moments alongside a factored second-order second-moment
         factored_2nd = group.get('factored_2nd', False)
+
+        # ALIAS Adam Distance Tracking
+        grad, d_t = update_alias_adam_distance(
+            grad, 
+            state, 
+            group, 
+            beta2,
+        )
 
         if state['factored']:
             d1, d2 = state['effective_shape']
@@ -433,6 +451,7 @@ class AdamW_adv(torch.optim.Optimizer):
             del denom
 
         update_scaling = step_size * A if group['use_atan2'] else step_size
+        update_scaling = update_scaling * d_t
         if group.get('scaled_optm', False):
             update = scale_update(p, update, update_scaling, vector_state=state.get('spectral_v'))
         else:

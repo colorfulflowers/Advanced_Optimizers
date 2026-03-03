@@ -10,6 +10,7 @@ from ..util.Kourkoutas import KourkoutasHelper
 from ..util.update_util import _grams_update, _cautious_update, _scale_sim_AdEMAMix_update
 from ..util.scaled_optm import scale_update, is_spectral, init_spectral_norm
 from ..util.centered_decay import _init_anchor
+from ..util.alias_util import init_alias_adam_state, update_alias_adam_distance
 
 A = 4 / math.pi
 
@@ -146,6 +147,9 @@ class Adopt_adv(torch.optim.Optimizer):
         k_warmup_steps: int = 0,
         k_logging: int = 0,
         layer_key_fn: Optional[Callable] = None,
+        # ALIAS (Parameter-Free tracking)
+        alias_adam: bool = True,
+        d0: float = 1e-5,
         # Scaled Optimizer
         scaled_optm: bool = False,
         # Centered WD
@@ -186,6 +190,7 @@ class Adopt_adv(torch.optim.Optimizer):
             "alpha_grad": alpha_grad,
             "kourkoutas_beta": kourkoutas_beta, "beta2_min": beta2_min, "ema_alpha": ema_alpha,
             "tiny_spike": tiny_spike, "k_warmup_steps": k_warmup_steps, "k_logging": k_logging,
+            "alias_adam": alias_adam, "d0": d0, 
             "scaled_optm": scaled_optm,
             "centered_wd": centered_wd,
             "centered_wd_mode": centered_wd_mode,
@@ -312,6 +317,9 @@ class Adopt_adv(torch.optim.Optimizer):
 
             _init_anchor(p, state, group)
 
+            # Initialize ALIAS Adam distance tracking variables
+            init_alias_adam_state(p, state, group)
+
         current_step = state['step']
 
         # The first step is for initialization only (skip when use_atan2 as it's scale invariant).
@@ -356,6 +364,14 @@ class Adopt_adv(torch.optim.Optimizer):
 
         # Determine if we are using dense first-moments alongside a factored second-order second-moment
         factored_2nd = group.get('factored_2nd', False)
+
+        # ALIAS Adam Distance Tracking
+        grad, d_t = update_alias_adam_distance(
+            grad, 
+            state, 
+            group, 
+            beta2,
+        )
 
         if state['factored']:
             d1, d2 = state['effective_shape']
@@ -492,6 +508,7 @@ class Adopt_adv(torch.optim.Optimizer):
                 vt.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
 
         update_scaling = lr * A if self.use_atan2 else lr
+        update_scaling = update_scaling * d_t
 
         if group.get('scaled_optm', False):
             update = scale_update(p, update, update_scaling, vector_state=state.get('spectral_v'))

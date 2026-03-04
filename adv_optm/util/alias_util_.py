@@ -40,7 +40,15 @@ class AliasHelper:
                 'step_l1_acc': torch.tensor(0.0, device=p.device, dtype=torch.float32),
                 'tilde_d_inc_acc': torch.tensor(0.0, device=p.device, dtype=torch.float32),
                 'alias_lr': torch.tensor(self.d0, device=p.device, dtype=torch.float32),
+                # Track the total number of parameters in this bucket
+                'd_total': torch.tensor(0.0, device=p.device, dtype=torch.float32),
+                'd_total_synced': False,
             }
+
+        # Add parameter count to the bucket's total (only once per parameter)
+        if not state.get('alias_d_counted', False):
+            self.buckets[key]['d_total'] += p.numel()
+            state['alias_d_counted'] = True
 
         # Initialize per-tensor tracking variables
         g_max = grad.max().to(torch.float32)
@@ -71,8 +79,7 @@ class AliasHelper:
         # Fetch the LR that was used in the previous step
         prev_used_lr = state.get('alias_used_lr', current_lr)
 
-        # L1 norm of the actual SignSGD step taken is exactly prev_used_lr * d. 
-        # By masking with (prev_l1 > 0), we zero this out at t=0, enforcing the paper's 'if t != 0' rule.
+        # Calculate exact sum limits
         actual_step_l1 = torch.where(prev_l1 > 0, prev_used_lr * d, torch.tensor(0.0))
 
         # Memory-efficient L_inf approximation formula (Matches Section 3.3)
@@ -123,6 +130,11 @@ class AliasHelper:
         """Called at the end of optimizer.step() to compute the new LR for all buckets."""
         for key, bucket in self.buckets.items():
             if dist.is_available() and dist.is_initialized():
+                # Sync d_total safely (only once per run to avoid doubling every step)
+                if not bucket['d_total_synced']:
+                    dist.all_reduce(bucket['d_total'], op=dist.ReduceOp.SUM)
+                    bucket['d_total_synced'] = True
+
                 # Sync across nodes (MAX for numerator, SUM for denominators)
                 dist.all_reduce(bucket['max_diff_acc'], op=dist.ReduceOp.MAX)
                 dist_tensor = torch.stack([bucket['step_l1_acc'], bucket['tilde_d_inc_acc']])
@@ -130,12 +142,18 @@ class AliasHelper:
                 bucket['step_l1_acc'].copy_(dist_tensor[0])
                 bucket['tilde_d_inc_acc'].copy_(dist_tensor[1])
 
-            eta_inc = torch.where(bucket['step_l1_acc'] > 0, 
-                                  bucket['max_diff_acc'] / bucket['step_l1_acc'], 
+            # Normalization: 1/d scale
+            # This transforms the massive sums O(d) into exact weighted means O(1).
+            d_tot = bucket['d_total']
+            step_l1_mean = bucket['step_l1_acc'] / d_tot
+            tilde_d_inc_mean = bucket['tilde_d_inc_acc'] / d_tot
+
+            eta_inc = torch.where(step_l1_mean > 0, 
+                                  bucket['max_diff_acc'] / step_l1_mean, 
                                   torch.zeros_like(bucket['max_diff_acc']))
 
             bucket['alias_eta'].add_(eta_inc)
-            bucket['alias_tilde_d'].add_(bucket['tilde_d_inc_acc'])
+            bucket['alias_tilde_d'].add_(tilde_d_inc_mean)
 
             if (bucket['alias_eta'] > 0).all():
                 bucket['alias_d'].copy_(torch.maximum(bucket['alias_d'], bucket['alias_tilde_d']))

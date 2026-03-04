@@ -35,7 +35,9 @@ class AliasHelper:
                 'alias_d': torch.tensor(self.d0, device=p.device, dtype=torch.float32),
                 'alias_tilde_d': torch.tensor(0.0, device=p.device, dtype=torch.float32),
                 'alias_eta': torch.tensor(0.0, device=p.device, dtype=torch.float32),
-                'eta_inc_acc': torch.tensor(0.0, device=p.device, dtype=torch.float32),
+                # Track max numerator and sum denominator separately
+                'max_diff_acc': torch.tensor(0.0, device=p.device, dtype=torch.float32),
+                'step_l1_acc': torch.tensor(0.0, device=p.device, dtype=torch.float32),
                 'tilde_d_inc_acc': torch.tensor(0.0, device=p.device, dtype=torch.float32),
                 'alias_lr': torch.tensor(self.d0, device=p.device, dtype=torch.float32),
             }
@@ -56,43 +58,48 @@ class AliasHelper:
         else:
             state['alias_prev_sign'] = torch.zeros_like(grad, dtype=torch.uint8)
 
-    def accumulate(self, p, grad, state, prev_lr):
+    def accumulate(self, p, grad, state, current_lr):
         """Accumulate the eta and tilde_d increments into the bucket."""
         key = state['alias_bucket_key']
         bucket = self.buckets[key]
         
         g_max = grad.max().to(torch.float32)
         g_min = grad.min().to(torch.float32)
-        
+        d = p.numel() 
         prev_l1 = state['alias_prev_update_l1']
-        safe_prev_l1 = torch.where(prev_l1 > 0, prev_l1, torch.ones_like(prev_l1))
-        
+
+        # Fetch the LR that was used in the previous step
+        prev_used_lr = state.get('alias_used_lr', current_lr)
+
+        # L1 norm of the actual SignSGD step taken is exactly prev_used_lr * d. 
+        # By masking with (prev_l1 > 0), we zero this out at t=0, enforcing the paper's 'if t != 0' rule.
+        actual_step_l1 = torch.where(prev_l1 > 0, prev_used_lr * d, torch.tensor(0.0))
+
+        # Memory-efficient L_inf approximation formula (Matches Section 3.3)
         approx_max_diff = torch.maximum((g_max - state['alias_prev_grad_min']).abs(),
                                         (state['alias_prev_grad_max'] - g_min).abs())
-        
-        eta_inc = torch.where(prev_l1 > 0, approx_max_diff / safe_prev_l1, torch.zeros_like(prev_l1))
-        
+
         if state.get('factored'):
             d1, d2 = state['effective_shape']
             prev_sign_float = _unpack_bools(state['alias_prev_sign_packed'], original_m=d2).to(grad.dtype) * 2.0 - 1.0
-            dot_product = torch.mean(grad.view(d1, d2) * prev_sign_float).to(torch.float32)
+            dot_product = torch.sum(grad.view(d1, d2) * prev_sign_float).to(torch.float32)
         else:
             prev_sign_float = state['alias_prev_sign'].to(grad.dtype) * 2.0 - 1.0
-            dot_product = torch.mean(grad * prev_sign_float).to(torch.float32)
+            dot_product = torch.sum(grad * prev_sign_float).to(torch.float32)
             
-        tilde_d_inc = prev_lr * dot_product
-        tilde_d_inc = torch.where(prev_l1 > 0, tilde_d_inc, torch.zeros_like(tilde_d_inc))
-        
-        # Accumulate to the shared bucket
-        bucket['eta_inc_acc'].add_(eta_inc)
+        tilde_d_inc = torch.where(actual_step_l1 > 0, prev_used_lr * dot_product, torch.zeros_like(dot_product))
+
+        # Accumulate global terms independently (MAX for L_inf, SUM for L_1)
+        bucket['max_diff_acc'].copy_(torch.maximum(bucket['max_diff_acc'], approx_max_diff))
+        bucket['step_l1_acc'].add_(actual_step_l1)
         bucket['tilde_d_inc_acc'].add_(tilde_d_inc)
         
-        # Update tensor-specific history
+        # Update tensor-specific history for the next step
         state['alias_prev_grad_max'].copy_(g_max)
         state['alias_prev_grad_min'].copy_(g_min)
+        state['alias_used_lr'] = current_lr
 
     def get_lr(self, state, base_lr):
-        """Fetch the shared LR for this parameter's bucket."""
         key = state['alias_bucket_key']
         bucket = self.buckets[key]
 
@@ -116,23 +123,28 @@ class AliasHelper:
         """Called at the end of optimizer.step() to compute the new LR for all buckets."""
         for key, bucket in self.buckets.items():
             if dist.is_available() and dist.is_initialized():
-                dist_tensor = torch.stack([bucket['eta_inc_acc'], bucket['tilde_d_inc_acc']])
+                # Sync across nodes (MAX for numerator, SUM for denominators)
+                dist.all_reduce(bucket['max_diff_acc'], op=dist.ReduceOp.MAX)
+                dist_tensor = torch.stack([bucket['step_l1_acc'], bucket['tilde_d_inc_acc']])
                 dist.all_reduce(dist_tensor, op=dist.ReduceOp.SUM)
-                eta_inc_sum = dist_tensor[0]
-                tilde_d_inc_sum = dist_tensor[1]
-            else:
-                eta_inc_sum = bucket['eta_inc_acc']
-                tilde_d_inc_sum = bucket['tilde_d_inc_acc']
+                bucket['step_l1_acc'].copy_(dist_tensor[0])
+                bucket['tilde_d_inc_acc'].copy_(dist_tensor[1])
 
-            bucket['alias_eta'].add_(eta_inc_sum)
-            bucket['alias_tilde_d'].add_(tilde_d_inc_sum)
+            eta_inc = torch.where(bucket['step_l1_acc'] > 0, 
+                                  bucket['max_diff_acc'] / bucket['step_l1_acc'], 
+                                  torch.zeros_like(bucket['max_diff_acc']))
+
+            bucket['alias_eta'].add_(eta_inc)
+            bucket['alias_tilde_d'].add_(bucket['tilde_d_inc_acc'])
 
             if (bucket['alias_eta'] > 0).all():
-                current_d_estimate = bucket['alias_tilde_d'] / torch.sqrt(bucket['alias_eta'])
-                bucket['alias_d'].copy_(torch.maximum(bucket['alias_d'], current_d_estimate))
-            alias_lr = bucket['alias_d'] / torch.sqrt(bucket['alias_eta'])
+                bucket['alias_d'].copy_(torch.maximum(bucket['alias_d'], bucket['alias_tilde_d']))
+
+            # Option I states gamma^t = sqrt(d^t) / sqrt(eta^t)
+            alias_lr = torch.sqrt(torch.relu(bucket['alias_d'])) / torch.sqrt(bucket['alias_eta'])
             bucket['alias_lr'].copy_(torch.where(bucket['alias_eta'] > 0, alias_lr, bucket['alias_lr']))
 
             # Reset accumulators for the next step
-            bucket['eta_inc_acc'].zero_()
+            bucket['max_diff_acc'].zero_()
+            bucket['step_l1_acc'].zero_()
             bucket['tilde_d_inc_acc'].zero_()

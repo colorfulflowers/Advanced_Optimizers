@@ -93,7 +93,7 @@ class SignSGD_adv(torch.optim.Optimizer):
         l1_adaptive: bool = False,
         # ALIAS step size adaptation
         use_alias: bool = True,
-        alias_d0: float = 1e-3,
+        alias_d0: float = 1e-5,
         alias_mode: str = 'global',
         # Centered WD
         centered_wd: float = 0.0,
@@ -298,6 +298,13 @@ class SignSGD_adv(torch.optim.Optimizer):
                 if freeze_on_flip:
                     state['sign'] = _pack_bools(raw_update > 0)
 
+            if freeze_on_flip:
+                # Fast binary diff (XOR) from momentum sign directly
+                flipped_packed = prev_sign_packed ^ state['sign']
+                flipped_mask = _unpack_bools(flipped_packed, original_m=d2).view_as(raw_update)
+                raw_update = torch.where(flipped_mask, 0.0, raw_update)
+                del prev_sign_packed, flipped_packed, flipped_mask
+
             if group.get('use_alias', False):
                 self.alias_helper.update_post_step(state, raw_update)
 
@@ -306,12 +313,6 @@ class SignSGD_adv(torch.optim.Optimizer):
             update = _get_lion_k_update(raw_update, kappa_p)
             update = update.view(p.shape)
 
-            if freeze_on_flip:
-                # Fast binary diff (XOR) from momentum sign directly
-                flipped_packed = prev_sign_packed ^ state['sign']
-                flipped_mask = _unpack_bools(flipped_packed, original_m=d2).view_as(update)
-                update = torch.where(flipped_mask, 0.0, update)
-                del prev_sign_packed, flipped_packed, flipped_mask
 
         else:
             # Fallback to standard SignSGD logic
@@ -328,15 +329,15 @@ class SignSGD_adv(torch.optim.Optimizer):
 
             l1_mean = _get_l1_adaptive_lr(p, raw_update, state, group, kappa_p)
 
+            if freeze_on_flip:
+                current_sign = (raw_update > 0).to(torch.uint8)
+                raw_update = torch.where(current_sign == state['prev_sign'], raw_update, 0.0)
+                state['prev_sign'] = current_sign
+
             if group.get('use_alias', False):
                 self.alias_helper.update_post_step(state, raw_update)
 
             update = _get_lion_k_update(raw_update, kappa_p)
-
-            if freeze_on_flip:
-                current_sign = (raw_update > 0).to(torch.uint8)
-                update = torch.where(current_sign == state['prev_sign'], update, 0.0)
-                state['prev_sign'] = current_sign
 
         if l1_mean is not None:
             update.mul_(l1_mean)

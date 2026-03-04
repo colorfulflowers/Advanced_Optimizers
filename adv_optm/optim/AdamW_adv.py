@@ -246,7 +246,7 @@ class AdamW_adv(torch.optim.Optimizer):
             device = p.device
 
             # Initialize ALIAS Adam distance tracking variables
-            init_alias_adam_state(p, state, group)
+            init_alias_adam_state(self, p, state, group)
 
             if state['factored']:
                 state['effective_shape'] = _get_effective_shape(p.numel())

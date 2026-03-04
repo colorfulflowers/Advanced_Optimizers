@@ -93,7 +93,8 @@ class SignSGD_adv(torch.optim.Optimizer):
         l1_adaptive: bool = False,
         # ALIAS step size adaptation
         use_alias: bool = True,
-        alias_d0: float = 1e-5,
+        alias_d0: float = 1e-3,
+        alias_mode: str = 'global',
         # Centered WD
         centered_wd: float = 0.0,
         centered_wd_mode: str = 'float8',
@@ -128,6 +129,7 @@ class SignSGD_adv(torch.optim.Optimizer):
             l1_adaptive=l1_adaptive,
             use_alias=use_alias,
             alias_d0=alias_d0,
+            alias_mode=alias_mode,
             centered_wd= centered_wd,
             centered_wd_mode= centered_wd_mode,
             nnmf_factor=nnmf_factor,
@@ -147,6 +149,10 @@ class SignSGD_adv(torch.optim.Optimizer):
         self._compiled_step_parameter = None
         if compiled_optimizer:
             self.compile(fullgraph=True)
+
+        if use_alias:
+            from ..util.alias_util_ import AliasHelper
+            self.alias_helper = AliasHelper(mode=alias_mode, d0=alias_d0)
 
     def load_state_dict(self, state_dict: dict) -> None:
         """
@@ -216,27 +222,7 @@ class SignSGD_adv(torch.optim.Optimizer):
 
             # ALIAS LR Calculation
             if group.get('use_alias', False):
-                # Convert grad to float32 for stable math
-                g_max = grad.max().to(torch.float32)
-                g_min = grad.min().to(torch.float32)
-
-                if 'alias_d' not in state:
-                    state['alias_d'] = torch.tensor(group['alias_d0'], device=p.device, dtype=torch.float32)
-                    state['alias_tilde_d'] = torch.tensor(0.0, device=p.device, dtype=torch.float32)
-                    state['alias_eta'] = torch.tensor(0.0, device=p.device, dtype=torch.float32)
-                    state['alias_prev_grad_max'] = g_max.clone()
-                    state['alias_prev_grad_min'] = g_min.clone()
-                    state['alias_prev_update_l1'] = torch.tensor(0.0, device=p.device, dtype=torch.float32)
-
-                    if isinstance(lr, torch.Tensor):
-                        state['alias_prev_lr'] = lr.clone().to(torch.float32)
-                    else:
-                        state['alias_prev_lr'] = torch.tensor(lr, device=p.device, dtype=torch.float32)
-
-                    if state.get('factored'):
-                        state['alias_prev_sign_packed'] = torch.zeros((d1, packed_d2), dtype=torch.uint8, device=p.device)
-                    else:
-                        state['alias_prev_sign'] = torch.zeros_like(grad, dtype=torch.uint8)
+                self.alias_helper.init_state(p, state, group, grad)
 
 
             _init_anchor(p, state, group)
@@ -282,6 +268,11 @@ class SignSGD_adv(torch.optim.Optimizer):
         elif momentum == 0:
             alpha_grad = 1
 
+        if group.get('use_alias', False):
+            current_alias_lr = self.alias_helper.get_lr(state, lr)
+            self.alias_helper.accumulate(p, grad, state, current_alias_lr)
+            lr = current_alias_lr
+
         if state.get('factored'):
             # Factored Path
             d1, d2 = state['effective_shape']
@@ -306,6 +297,9 @@ class SignSGD_adv(torch.optim.Optimizer):
                 raw_update = grad_reshaped.clone()
                 if freeze_on_flip:
                     state['sign'] = _pack_bools(raw_update > 0)
+
+            if group.get('use_alias', False):
+                self.alias_helper.update_post_step(state, raw_update)
 
             l1_mean = _get_l1_adaptive_lr(p, raw_update, state, group, kappa_p)
 
@@ -334,54 +328,15 @@ class SignSGD_adv(torch.optim.Optimizer):
 
             l1_mean = _get_l1_adaptive_lr(p, raw_update, state, group, kappa_p)
 
+            if group.get('use_alias', False):
+                self.alias_helper.update_post_step(state, raw_update)
+
             update = _get_lion_k_update(raw_update, kappa_p)
 
             if freeze_on_flip:
                 current_sign = (raw_update > 0).to(torch.uint8)
                 update = torch.where(current_sign == state['prev_sign'], update, 0.0)
                 state['prev_sign'] = current_sign
-
-        # ALIAS LR Calculation
-        if group.get('use_alias', False):
-            # Convert grad to float32 for stable math
-            g_max = grad.max().to(torch.float32)
-            g_min = grad.min().to(torch.float32)
-
-            prev_l1 = state['alias_prev_update_l1']
-            safe_prev_l1 = torch.where(prev_l1 > 0, prev_l1, torch.ones_like(prev_l1))
-
-            approx_max_diff = torch.maximum((g_max - state['alias_prev_grad_min']).abs(),
-                                            (state['alias_prev_grad_max'] - g_min).abs())
-
-            eta_inc = torch.where(prev_l1 > 0, approx_max_diff / safe_prev_l1, torch.zeros_like(prev_l1))
-            state['alias_eta'].add_(eta_inc)
-
-            if state.get('factored'):
-                d1, d2 = state['effective_shape']
-                prev_sign_float = _unpack_bools(state['alias_prev_sign_packed'], original_m=d2).to(grad.dtype) * 2.0 - 1.0
-                dot_product = torch.mean(grad.view(d1, d2) * prev_sign_float).to(torch.float32)
-            else:
-                prev_sign_float = state['alias_prev_sign'].to(grad.dtype) * 2.0 - 1.0
-                dot_product = torch.mean(grad * prev_sign_float).to(torch.float32)
-
-            tilde_d_inc = state['alias_prev_lr'] * dot_product
-            tilde_d_inc = torch.where(prev_l1 > 0, tilde_d_inc, torch.zeros_like(tilde_d_inc))
-
-            state['alias_tilde_d'].add_(tilde_d_inc)
-            state['alias_d'].copy_(torch.maximum(state['alias_d'], state['alias_tilde_d']))
-
-            state['alias_prev_grad_max'].copy_(g_max)
-            state['alias_prev_grad_min'].copy_(g_min)
-
-            alias_lr = torch.sqrt(state['alias_d'] / state['alias_eta'])
-
-            if not isinstance(lr, torch.Tensor):
-                lr_t = torch.tensor(lr, dtype=torch.float32)
-            else:
-                lr_t = lr.to(torch.float32)
-
-            lr = torch.where(state['alias_eta'] > 0, alias_lr, lr_t)
-            state['alias_prev_lr'].copy_(lr)
 
         if l1_mean is not None:
             update.mul_(l1_mean)
@@ -390,14 +345,6 @@ class SignSGD_adv(torch.optim.Optimizer):
             update = scale_update(p, update, lr, vector_state=state.get('spectral_v'))
         else:
             update.mul_(lr)
-
-        if group.get('use_alias', False):
-            if state.get('factored'):
-                state['alias_prev_sign_packed'].copy_(_pack_bools(raw_update > 0))
-            else:
-                state['alias_prev_sign'].copy_((raw_update > 0).to(torch.uint8))
-
-            state['alias_prev_update_l1'].copy_(update.abs().mean().to(torch.float32))
 
         param_update.apply_parameter_update(self, p, group, update, lr, random_int_tensor=random_int_tensor)
 
@@ -417,4 +364,6 @@ class SignSGD_adv(torch.optim.Optimizer):
                 if p.grad is not None:
                     self.step_parameter(p, group, i)
 
+        if hasattr(self, 'alias_helper'):
+            self.alias_helper.calculate_lr()
         return loss

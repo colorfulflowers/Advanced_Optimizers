@@ -324,7 +324,7 @@ class Adopt_adv(torch.optim.Optimizer):
             _init_anchor(p, state, group)
 
             # Initialize ALIAS Adam distance tracking variables
-            init_alias_adam_state(p, state, group)
+            init_alias_adam_state(self, p, state, group)
 
         current_step = state['step']
 

@@ -7,7 +7,7 @@ from ..util import param_update
 from ..util.OrthoGrad import _orthogonalize_gradient
 from ..util.factorization_util import _get_effective_shape, _reconstruct_state, _factorize_state, _pack_bools, _unpack_bools
 from ..util.lion_k import _get_lion_k_update
-from ..util.update_util import _get_l1_adaptive_lr
+from ..util.update_util import _get_l1_adaptive_lr, _scale_sim_AdEMAMix_update
 from ..util.scaled_optm import scale_update, is_spectral, init_spectral_norm
 from ..util.centered_decay import _init_anchor
 
@@ -93,8 +93,8 @@ class SignSGD_adv(torch.optim.Optimizer):
         l1_adaptive: bool = False,
         # ALIAS step size adaptation
         use_alias: bool = True,
-        alias_d0: float = 1e-5,
-        alias_mode: str = 'global',
+        alias_d0: float = 1e-4,
+        alias_mode: str = 'global', # 'per-param', 'per-shape', 'global'.
         # Centered WD
         centered_wd: float = 0.0,
         centered_wd_mode: str = 'float8',
@@ -265,7 +265,7 @@ class SignSGD_adv(torch.optim.Optimizer):
         freeze_on_flip = group.get("freeze_on_flip", False) and kappa_p == 1
         if not Simplified_AdEMAMix:
             alpha_grad = 0
-        elif momentum == 0:
+        if momentum == 0:
             alpha_grad = 1
 
         if group.get('use_alias', False):
@@ -306,7 +306,8 @@ class SignSGD_adv(torch.optim.Optimizer):
                 del prev_sign_packed, flipped_packed, flipped_mask
 
             if group.get('use_alias', False):
-                self.alias_helper.update_post_step(state, raw_update)
+                scale_factor = _scale_sim_AdEMAMix_update(momentum, state["step"] + 1, alpha_grad, 1)
+                self.alias_helper.update_post_step(state, raw_update, scale_factor)
 
             l1_mean = _get_l1_adaptive_lr(p, raw_update, state, group, kappa_p)
 
@@ -335,7 +336,8 @@ class SignSGD_adv(torch.optim.Optimizer):
                 state['prev_sign'] = current_sign
 
             if group.get('use_alias', False):
-                self.alias_helper.update_post_step(state, raw_update)
+                scale_factor = _scale_sim_AdEMAMix_update(momentum, state["step"] + 1, alpha_grad, 1)
+                self.alias_helper.update_post_step(state, raw_update, scale_factor)
 
             update = _get_lion_k_update(raw_update, kappa_p)
 

@@ -118,13 +118,13 @@ class AliasHelper:
 
         return torch.where(bucket['alias_eta'] > 0, alias_lr, base_lr_t)
 
-    def update_post_step(self, state, raw_update):
+    def update_post_step(self, state, raw_update, scale_factor: float=1):
         """Store the current step's signs and l1 norm for the next step."""
         if state.get('factored'):
             state['alias_prev_sign_packed'].copy_(_pack_bools(raw_update > 0))
         else:
             state['alias_prev_sign'].copy_((raw_update > 0).to(torch.uint8))
-        state['alias_prev_update_l1'].copy_(raw_update.abs().mean().to(torch.float32))
+        state['alias_prev_update_l1'].copy_(raw_update.abs().mean().to(torch.float32)/scale_factor)
 
     def calculate_lr(self):
         """Called at the end of optimizer.step() to compute the new LR for all buckets."""

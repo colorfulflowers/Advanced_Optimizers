@@ -10,6 +10,7 @@ from ..util.lion_k import _get_lion_k_update
 from ..util.update_util import _get_l1_adaptive_lr, _scale_sim_AdEMAMix_update
 from ..util.scaled_optm import scale_update, is_spectral, init_spectral_norm
 from ..util.centered_decay import _init_anchor
+from ..util.signed_util import inject_error_feedback, update_error_buffer
 
 
 class SignSGD_adv(torch.optim.Optimizer):
@@ -40,6 +41,7 @@ class SignSGD_adv(torch.optim.Optimizer):
             parameter dimensionality. Sets p=2.0 for 4D tensors (Conv2D) (Biases/Norms) to
             use Spherical updates, and p=1.0 for others (Linear/Embeddings) to use Sign
             updates. Overrides explicit kappa_p value. (default: False).
+        error_feedback (bool): whether to inject the error of the sign to the update, ensuring that the error stays bounded. (default: False)
         Simplified_AdEMAMix (bool): whether to use the Simplified AdEMAMix update rule.
             This changes the EMA to accumulator and the update numerator to `alpha_grad * grad + mt`, which can be
             more responsive, especially for small batch sizes. (default: False)
@@ -85,6 +87,8 @@ class SignSGD_adv(torch.optim.Optimizer):
         # Projection-k
         kappa_p: float = 1.0,
         auto_kappa_p: bool = True,
+        # Error Feedback
+        error_feedback: bool = True,
         # Simplified_AdEMAMix
         alpha_grad: float = 1.0,
         Simplified_AdEMAMix: bool = False,
@@ -92,7 +96,7 @@ class SignSGD_adv(torch.optim.Optimizer):
         freeze_on_flip: bool = False,
         l1_adaptive: bool = False,
         # ALIAS step size adaptation
-        use_alias: bool = True,
+        use_alias: bool = False,
         alias_d0: float = 1e-5,
         alias_mode: str = 'global', # 'per-param', 'per-shape', 'global'.
         alias_exact_linf: bool = True,
@@ -123,6 +127,7 @@ class SignSGD_adv(torch.optim.Optimizer):
             orthogonal_gradient=orthogonal_gradient,
             kappa_p=kappa_p,
             auto_kappa_p=auto_kappa_p,
+            error_feedback=error_feedback,
             alpha_grad=alpha_grad,
             Simplified_AdEMAMix=Simplified_AdEMAMix,
             scaled_optm= scaled_optm,
@@ -300,6 +305,8 @@ class SignSGD_adv(torch.optim.Optimizer):
                 if freeze_on_flip:
                     state['sign'] = _pack_bools(raw_update > 0)
 
+            raw_update = inject_error_feedback(raw_update, state, group)
+
             if freeze_on_flip:
                 # Fast binary diff (XOR) from momentum sign directly
                 flipped_packed = prev_sign_packed ^ state['sign']
@@ -313,7 +320,11 @@ class SignSGD_adv(torch.optim.Optimizer):
 
             l1_mean = _get_l1_adaptive_lr(p, raw_update, state, group, kappa_p)
 
+            true_update = raw_update.clone() if group.get('error_feedback') else None
+
             update = _get_lion_k_update(raw_update, kappa_p)
+            update_error_buffer(true_update, update, state, group)
+
             update = update.view(p.shape)
 
 
@@ -330,6 +341,8 @@ class SignSGD_adv(torch.optim.Optimizer):
             else:
                 raw_update = grad.clone()
 
+            raw_update = inject_error_feedback(raw_update, state, group)
+
             l1_mean = _get_l1_adaptive_lr(p, raw_update, state, group, kappa_p)
 
             if freeze_on_flip:
@@ -341,7 +354,10 @@ class SignSGD_adv(torch.optim.Optimizer):
                 scale_factor = _scale_sim_AdEMAMix_update(momentum, state["step"] + 1, alpha_grad, 1)
                 self.alias_helper.update_post_step(state, raw_update, scale_factor)
 
+            true_update = raw_update.clone() if group.get('error_feedback') else None
+
             update = _get_lion_k_update(raw_update, kappa_p)
+            update_error_buffer(true_update, update, state, group)
 
         if l1_mean is not None:
             update.mul_(l1_mean)

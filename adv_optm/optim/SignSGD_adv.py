@@ -93,8 +93,9 @@ class SignSGD_adv(torch.optim.Optimizer):
         l1_adaptive: bool = False,
         # ALIAS step size adaptation
         use_alias: bool = True,
-        alias_d0: float = 1e-4,
+        alias_d0: float = 1e-5,
         alias_mode: str = 'global', # 'per-param', 'per-shape', 'global'.
+        alias_exact_linf: bool = True,
         # Centered WD
         centered_wd: float = 0.0,
         centered_wd_mode: str = 'float8',
@@ -130,6 +131,7 @@ class SignSGD_adv(torch.optim.Optimizer):
             use_alias=use_alias,
             alias_d0=alias_d0,
             alias_mode=alias_mode,
+            alias_exact_linf=alias_exact_linf,
             centered_wd= centered_wd,
             centered_wd_mode= centered_wd_mode,
             nnmf_factor=nnmf_factor,
@@ -152,7 +154,7 @@ class SignSGD_adv(torch.optim.Optimizer):
 
         if use_alias:
             from ..util.alias_util_ import AliasHelper
-            self.alias_helper = AliasHelper(mode=alias_mode, d0=alias_d0)
+            self.alias_helper = AliasHelper(mode=alias_mode, d0=alias_d0, exact_linf=alias_exact_linf)
 
     def load_state_dict(self, state_dict: dict) -> None:
         """

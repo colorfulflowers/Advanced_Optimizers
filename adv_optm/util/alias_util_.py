@@ -6,14 +6,16 @@ class AliasHelper:
     """
     Manages ALIAS step size adaptation at different granularities.
     """
-    def __init__(self, mode='per-param', d0=1e-5):
+    def __init__(self, mode='per-param', d0=1e-5, exact_linf=False):
         """
         Args:
             mode: 'per-param' (individual LR), 'per-shape' (shared LR for identical shapes), or 'global' (one LR).
             d0: Initial distance approximation.
+            exact_linf: If True, computes exact L_inf norm of gradient differences by storing full previous gradients.
         """
         self.mode = mode
         self.d0 = d0
+        self.exact_linf = exact_linf
         self.buckets = {}
 
     def get_bucket_key(self, p):
@@ -51,11 +53,14 @@ class AliasHelper:
             state['alias_d_counted'] = True
 
         # Initialize per-tensor tracking variables
-        g_max = grad.max().to(torch.float32)
-        g_min = grad.min().to(torch.float32)
+        if self.exact_linf:
+            state['alias_prev_grad'] = grad.clone()
+        else:
+            g_max = grad.max().to(torch.float32)
+            g_min = grad.min().to(torch.float32)
+            state['alias_prev_grad_max'] = g_max.clone()
+            state['alias_prev_grad_min'] = g_min.clone()
 
-        state['alias_prev_grad_max'] = g_max.clone()
-        state['alias_prev_grad_min'] = g_min.clone()
         state['alias_prev_update_l1'] = torch.tensor(0.0, device=p.device, dtype=torch.float32)
         state['alias_bucket_key'] = key
 
@@ -71,8 +76,6 @@ class AliasHelper:
         key = state['alias_bucket_key']
         bucket = self.buckets[key]
         
-        g_max = grad.max().to(torch.float32)
-        g_min = grad.min().to(torch.float32)
         d = p.numel() 
         prev_l1 = state['alias_prev_update_l1']
 
@@ -82,9 +85,19 @@ class AliasHelper:
         # Calculate exact sum limits
         actual_step_l1 = torch.where(prev_l1 > 0, prev_used_lr * d, torch.tensor(0.0))
 
-        # Memory-efficient L_inf approximation formula (Matches Section 3.3)
-        approx_max_diff = torch.maximum((g_max - state['alias_prev_grad_min']).abs(),
-                                        (state['alias_prev_grad_max'] - g_min).abs())
+        if self.exact_linf:
+            exact_max_diff = (grad - state['alias_prev_grad']).abs().max().to(torch.float32)
+            bucket['max_diff_acc'].copy_(torch.maximum(bucket['max_diff_acc'], exact_max_diff))
+            state['alias_prev_grad'].copy_(grad)
+        else:
+            g_max = grad.max().to(torch.float32)
+            g_min = grad.min().to(torch.float32)
+            # Memory-efficient L_inf approximation formula (Matches Section 3.3)
+            approx_max_diff = torch.maximum((g_max - state['alias_prev_grad_min']).abs(),
+                                            (state['alias_prev_grad_max'] - g_min).abs())
+            bucket['max_diff_acc'].copy_(torch.maximum(bucket['max_diff_acc'], approx_max_diff))
+            state['alias_prev_grad_max'].copy_(g_max)
+            state['alias_prev_grad_min'].copy_(g_min)
 
         if state.get('factored'):
             d1, d2 = state['effective_shape']
@@ -97,13 +110,10 @@ class AliasHelper:
         tilde_d_inc = torch.where(actual_step_l1 > 0, prev_used_lr * dot_product, torch.zeros_like(dot_product))
 
         # Accumulate global terms independently (MAX for L_inf, SUM for L_1)
-        bucket['max_diff_acc'].copy_(torch.maximum(bucket['max_diff_acc'], approx_max_diff))
         bucket['step_l1_acc'].add_(actual_step_l1)
         bucket['tilde_d_inc_acc'].add_(tilde_d_inc)
         
         # Update tensor-specific history for the next step
-        state['alias_prev_grad_max'].copy_(g_max)
-        state['alias_prev_grad_min'].copy_(g_min)
         state['alias_used_lr'] = current_lr
 
     def get_lr(self, state, base_lr):

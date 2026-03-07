@@ -10,7 +10,7 @@ from ..util.lion_k import _get_lion_k_update
 from ..util.update_util import _get_l1_adaptive_lr, _scale_sim_AdEMAMix_update
 from ..util.scaled_optm import scale_update, is_spectral, init_spectral_norm
 from ..util.centered_decay import _init_anchor
-from ..util.signed_util import inject_error_feedback, update_error_buffer
+from ..util.signed_util import inject_error_feedback, update_error_buffer, apply_stochastic_sign
 
 
 class SignSGD_adv(torch.optim.Optimizer):
@@ -41,6 +41,7 @@ class SignSGD_adv(torch.optim.Optimizer):
             parameter dimensionality. Sets p=2.0 for 4D tensors (Conv2D) (Biases/Norms) to
             use Spherical updates, and p=1.0 for others (Linear/Embeddings) to use Sign
             updates. Overrides explicit kappa_p value. (default: False).
+        stochastic_sign (bool): whether to use the Stochastic Sign operator. (default: False)
         error_feedback (bool): whether to inject the error of the sign to the update, ensuring that the error stays bounded. (default: False)
         Simplified_AdEMAMix (bool): whether to use the Simplified AdEMAMix update rule.
             This changes the EMA to accumulator and the update numerator to `alpha_grad * grad + mt`, which can be
@@ -87,6 +88,8 @@ class SignSGD_adv(torch.optim.Optimizer):
         # Projection-k
         kappa_p: float = 1.0,
         auto_kappa_p: bool = True,
+        # Stochastic Sign Operator
+        stochastic_sign: bool = True,
         # Error Feedback
         error_feedback: bool = True,
         # Simplified_AdEMAMix
@@ -127,6 +130,7 @@ class SignSGD_adv(torch.optim.Optimizer):
             orthogonal_gradient=orthogonal_gradient,
             kappa_p=kappa_p,
             auto_kappa_p=auto_kappa_p,
+            stochastic_sign=stochastic_sign,
             error_feedback=error_feedback,
             alpha_grad=alpha_grad,
             Simplified_AdEMAMix=Simplified_AdEMAMix,
@@ -235,21 +239,24 @@ class SignSGD_adv(torch.optim.Optimizer):
             _init_anchor(p, state, group)
 
         random_int_tensor = None
+        random_noise_tensor = None
 
         if group.get('compiled_optimizer', False):
             if p.dtype == torch.bfloat16 and self.stochastic_rounding:
                 # Pre-generate random tensor for stochastic rounding if needed.
                 random_int_tensor = param_update._get_random_int_for_sr(p)
+            if group.get('stochastic_sign', False):
+                random_noise_tensor = param_update._get_random_noise_for_sso(p)
             step_param_fn = self._compiled_step_parameter
         else:
             step_param_fn = self._step_parameter
 
-        step_param_fn(p, grad, state, group, lr, random_int_tensor)
+        step_param_fn(p, grad, state, group, lr, random_int_tensor, random_noise_tensor)
 
         if group.get("l1_adaptive", False) or group.get("use_alias", False):
             state["step"] += 1
 
-    def _step_parameter(self, p, grad, state, group, lr, random_int_tensor):
+    def _step_parameter(self, p, grad, state, group, lr, random_int_tensor, random_noise_tensor):
         if grad.dtype != torch.float32 and state.get('factored', False):
             grad = grad.float()
 
@@ -322,10 +329,14 @@ class SignSGD_adv(torch.optim.Optimizer):
 
             true_update = raw_update.clone() if group.get('error_feedback') else None
 
-            update = _get_lion_k_update(raw_update, kappa_p)
-            update_error_buffer(true_update, update, state, group)
-
             update = update.view(p.shape)
+
+            if group.get('stochastic_sign', False):
+                update = apply_stochastic_sign(raw_update, noise=random_noise_tensor)
+            else:
+                update = _get_lion_k_update(raw_update, kappa_p)
+
+            update_error_buffer(true_update, update, state, group)
 
 
         else:
@@ -356,7 +367,11 @@ class SignSGD_adv(torch.optim.Optimizer):
 
             true_update = raw_update.clone() if group.get('error_feedback') else None
 
-            update = _get_lion_k_update(raw_update, kappa_p)
+            if group.get('stochastic_sign', False):
+                update = apply_stochastic_sign(raw_update, noise=random_noise_tensor)
+            else:
+                update = _get_lion_k_update(raw_update, kappa_p)
+
             update_error_buffer(true_update, update, state, group)
 
         if l1_mean is not None:

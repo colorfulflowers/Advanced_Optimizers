@@ -253,7 +253,7 @@ class SignSGD_adv(torch.optim.Optimizer):
         if grad.dtype != torch.float32 and state.get('factored', False):
             grad = grad.float()
 
-        if group["orthogonal_gradient"]:
+        if getattr(p, '_is_dora_scale', False):
             grad = _orthogonalize_gradient(p, grad)
 
         # Projection logic (inspired from Lion-K)

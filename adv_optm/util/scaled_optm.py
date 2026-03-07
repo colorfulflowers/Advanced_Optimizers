@@ -53,7 +53,7 @@ def scale_wds(wd: float, cwd: float, p: torch.Tensor) -> tuple[float, float]:
     """
     # DoRA Scale (Magnitude Vector)
     if getattr(p, '_is_dora_scale', False):
-        return wd, cwd
+        return 0, cwd
 
     conflict = cwd != 0
 

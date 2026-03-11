@@ -169,6 +169,9 @@ class Mano_adv(torch.optim.Optimizer):
             if group.get('use_mano') is None: # Fallback
                  group['use_mano'] = group.get('optim_type') == 'mano'
 
+            for p in group['params']:
+                self.__init_state(p, group)
+
             # Initialize step for rotation
             group['steps'] = 0
 
@@ -278,7 +281,7 @@ class Mano_adv(torch.optim.Optimizer):
             step_size = group['lr'] / bias_correction1
 
             if is_compiled:
-                step_size = torch.as_tensor(step_size, dtype=torch.float64)
+                step_size = torch.as_tensor(step_size)
                 adam_step_param = self._compiled_adam_step_parameter
             else:
                 adam_step_param = Muon_AuxAdam._adam_step_parameter
@@ -288,7 +291,7 @@ class Mano_adv(torch.optim.Optimizer):
 
         else: # Mano path
             if is_compiled:
-                lr = torch.as_tensor(group['lr'], dtype=torch.float64)
+                lr = torch.as_tensor(group['lr'])
                 mano_step_param = self._compiled_mano_step_parameter
             else:
                 lr = group['lr']
@@ -383,13 +386,13 @@ class Mano_adv(torch.optim.Optimizer):
         if group.get('scaled_optm', False) and p.ndim != 1:
             # Spectral normalization
             update = update_flat.view(p.shape)
-            update = spectral_normalization(update, lr, vector_state=state.get('spectral_v'))
+            update = spectral_normalization(update, vector_state=state.get('spectral_v'), lr=lr)
         else:
             # Apply Mano-RMS Rescaling
             update_flat = mano_rms_rescaling(p_flat, update_flat, dim, lr)
             update = update_flat.view(p.shape)
 
-        param_update.apply_parameter_update(self, p, group, update, lr=1.0, wd=weight_decay, random_int_tensor=random_int_tensor)
+        param_update.apply_parameter_update(self, p, group, update, lr=lr, wd=weight_decay, random_int_tensor=random_int_tensor)
 
     @torch.no_grad()
     def step(self, closure=None):

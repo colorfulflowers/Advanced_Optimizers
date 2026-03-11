@@ -8,6 +8,8 @@ from ..util.Mano_util import mano_orthogonalization, mano_rms_rescaling
 from ..util.factorization_util import _get_effective_shape, _factorize_state, _reconstruct_state
 from ..util.Kourkoutas import KourkoutasHelper
 from ..util import Muon_AuxAdam
+from ..util.scaled_optm import spectral_normalization, is_spectral, init_spectral_norm
+from ..util.centered_decay import _init_anchor
 
 class Mano_adv(torch.optim.Optimizer):
     """
@@ -41,6 +43,15 @@ class Mano_adv(torch.optim.Optimizer):
             2. 'auto_ft': original Mano rotation on Arbitrary dim.
             3. 'auto_adjusted_ft': Adjust the dimension rotation frequency according to their sizes, i.e., if one axis is X times larger, choose this axis X times more frequently in Mano.
             (default: 'auto_ft').
+        centered_wd (float): Centered Weight Decay coefficient. Instead of decaying weights
+            toward zero, they are decayed toward their initial values (anchors). This
+            can be used together with standard weight decay. (default: 0.0)
+        centered_wd_mode (str): The quantization format used to store the anchor
+            weights to save VRAM. Options include:
+            'full': Stores anchors in the original parameter's precision.
+            'float8': Uses torch.float8_e4m3fn for a balance of precision and memory.
+            'int8': Uses 8-bit block-wise quantization (block size 128).
+            'int4': Uses 4-bit block-wise quantization (block size 32).
         compiled_optimizer (bool): Whether to compile the step function. (default: False).
 
         --- Auxiliary AdamW_adv Parameters (used for 'adam' groups) ---
@@ -78,7 +89,12 @@ class Mano_adv(torch.optim.Optimizer):
         Simplified_AdEMAMix: bool = False,
         alpha_grad: float = 100.0,
         # Manifold Rotation Dimension
-        rotate_method: str = 'auto_ft',
+        rotate_method: str = 'auto_adjusted_ft',
+        # Scaled Optimizer
+        scaled_optm: bool = False,
+        # Centered WD
+        centered_wd: float = 0.0,
+        centered_wd_mode: str = 'float8',
         # torch.compile
         compiled_optimizer: bool = False,
         # --- AdamW_adv specific parameters ---
@@ -116,6 +132,8 @@ class Mano_adv(torch.optim.Optimizer):
             "nesterov": nesterov,
             "Simplified_AdEMAMix": Simplified_AdEMAMix, "alpha_grad": alpha_grad,
             "rotate_method": rotate_method,
+            "scaled_optm": scaled_optm,
+            "centered_wd": centered_wd, "centered_wd_mode": centered_wd_mode,
             'compiled_optimizer': compiled_optimizer,
             "use_mano": use_mano,
             # AdamW_adv defaults
@@ -220,6 +238,12 @@ class Mano_adv(torch.optim.Optimizer):
         else: # AdamW
             Muon_AuxAdam._init_auxadam_state(self, p, group)
             state['is_mano'] = False
+
+
+        if group.get('scaled_optm', False) and is_spectral(p):
+            init_spectral_norm(group, state, p)
+
+        _init_anchor(p, state, group)
 
     @torch.no_grad()
     def step_parameter(self, p: torch.Tensor, group: dict, i: int | None = None):
@@ -356,9 +380,14 @@ class Mano_adv(torch.optim.Optimizer):
         # Apply Mano Geometric Projection
         update_flat = mano_orthogonalization(p_flat, momentum_update, dim)
 
-        # Apply Mano-RMS Rescaling
-        update_flat = mano_rms_rescaling(p_flat, update_flat, dim, lr)
-        update = update_flat.view(p.shape)
+        if group.get('scaled_optm', False) and p.ndim != 1:
+            # Spectral normalization
+            update = update_flat.view(p.shape)
+            update = spectral_normalization(update, lr, vector_state=state.get('spectral_v'))
+        else:
+            # Apply Mano-RMS Rescaling
+            update_flat = mano_rms_rescaling(p_flat, update_flat, dim, lr)
+            update = update_flat.view(p.shape)
 
         param_update.apply_parameter_update(self, p, group, update, lr=1.0, wd=weight_decay, random_int_tensor=random_int_tensor)
 

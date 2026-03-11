@@ -7,7 +7,6 @@ def mano_orthogonalization(
     p: torch.Tensor,
     g: torch.Tensor,
     dim: int,
-    eps: float,
 ) -> torch.Tensor:
     """
     Core geometric projection for Mano.
@@ -19,7 +18,7 @@ def mano_orthogonalization(
     g = g.view(p.shape)
     # Project momentum onto Tangent Space
     # p_unit = p / ||p||
-    p_norm = torch.norm(p, p=2, dim=dim, keepdim=True).clamp_min_(eps)
+    p_norm = torch.norm(p, p=2, dim=dim, keepdim=True).clamp_min_(1e-12)
     p_unit = p / p_norm
 
     # dot = <g, p_unit>
@@ -29,7 +28,7 @@ def mano_orthogonalization(
 
     # Manifold Normalization (Mapping back to Oblique)
     # u = tangent / ||tangent||
-    tm_norm = torch.norm(tangent_momentum, p=2, dim=dim, keepdim=True).clamp_min_(eps)
+    tm_norm = torch.norm(tangent_momentum, p=2, dim=dim, keepdim=True).clamp_min_(1e-12)
     u = tangent_momentum / tm_norm
     return u
 

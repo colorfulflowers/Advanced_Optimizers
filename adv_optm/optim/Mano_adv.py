@@ -30,17 +30,17 @@ class Mano_adv(torch.optim.Optimizer):
         weight_decay (float): weight decay (L2 penalty) (default: 0.1).
         cautious_wd (bool): Enables Cautious Weight Decay. (default: False).
         nesterov (bool): enables Nesterov momentum (default: False).
-        mano_eps (float): epsilon for manifold normalization stability (default: 1e-8).
         stochastic_rounding (bool): whether to use stochastic rounding for BF16 parameter updates (default: True).
         vector_reshape (bool): whether to reshape 1D vectors into 2D matrices to apply low-rank compression (default: True).
         nnmf_factor (bool): whether to use SMMF factorization for the momentum state (default: False).
         use_mano (bool | None): whether to use Mano or AuxAdamW. MUST be provided either here or via `optim_type`.
         Simplified_AdEMAMix (bool): whether to use the Simplified AdEMAMix update rule for momentum. (default: False).
         alpha_grad (float): Mixing coefficient for Simplified AdEMAMix. (default: 100.0).
-        sycnorm_lora (bool): Whether to use synchronized normalization for LoRA matrices (Tall vs Wide) to align feature
-        learning. (default: False).
-        rescaled_lora_wd (bool): Whether to rescale weight decay by the theoretical squared Frobenius norm of LoRA factors,
-        and decouple it from the LR. Achieving consistent and scalable WD across ranks and LRs. (default: False).
+        rotate_method (str): Method to choose the manifold rotation dimension ('fixed', 'auto_ft', 'auto_adjusted_ft').
+            1. 'fixed': Rotates on the largest dim.
+            2. 'auto_ft': original Mano rotation on Arbitrary dim.
+            3. 'auto_adjusted_ft': Adjust the dimension rotation frequency according to their sizes, i.e., if one axis is X times larger, choose this axis X times more frequently in Mano.
+            (default: 'auto_ft').
         compiled_optimizer (bool): Whether to compile the step function. (default: False).
 
         --- Auxiliary AdamW_adv Parameters (used for 'adam' groups) ---
@@ -66,7 +66,6 @@ class Mano_adv(torch.optim.Optimizer):
         beta1: float = 0.95,
         weight_decay: float = 0.0,
         cautious_wd: bool = False,
-        mano_eps: float = 1e-8,
         # Stochastic Rounding for BF16
         stochastic_rounding: bool = True,
         # SMMF factorization
@@ -78,9 +77,8 @@ class Mano_adv(torch.optim.Optimizer):
         nesterov: bool = True,
         Simplified_AdEMAMix: bool = False,
         alpha_grad: float = 100.0,
-        # LoRA settings
-        sycnorm_lora: bool = False,
-        rescaled_lora_wd: bool = False,
+        # Manifold Rotation Dimension
+        rotate_method: str = 'auto_ft',
         # torch.compile
         compiled_optimizer: bool = False,
         # --- AdamW_adv specific parameters ---
@@ -114,11 +112,10 @@ class Mano_adv(torch.optim.Optimizer):
 
         defaults = {
             "lr": lr, "beta1": beta1, "weight_decay": weight_decay, "cautious_wd": cautious_wd,
-            "mano_eps": mano_eps,
             "nnmf_factor": nnmf_factor, "vector_reshape": vector_reshape,
             "nesterov": nesterov,
             "Simplified_AdEMAMix": Simplified_AdEMAMix, "alpha_grad": alpha_grad,
-            "sycnorm_lora":sycnorm_lora, "rescaled_lora_wd":rescaled_lora_wd, 
+            "rotate_method": rotate_method,
             'compiled_optimizer': compiled_optimizer,
             "use_mano": use_mano,
             # AdamW_adv defaults
@@ -286,37 +283,9 @@ class Mano_adv(torch.optim.Optimizer):
         beta1 = group['beta1']
         nesterov = group['nesterov']
         Simplified_AdEMAMix = group['Simplified_AdEMAMix']
-        sycnorm_lora = group['sycnorm_lora']
-        rescaled_lora_wd = group['rescaled_lora_wd']
+        rotate_method = group['rotate_method']
         alpha_grad = group['alpha_grad']
         weight_decay = group['weight_decay']
-        mano_eps = group['mano_eps']
-
-        # Rotating Manifold Dimension
-        step_parity = int(state['step'] % 2) # 0 or 1
-
-        R, C = p.shape
-        if sycnorm_lora:
-            if R > C: 
-                dim = step_parity
-            elif C > R:
-                dim = 1 - step_parity
-        else:
-            # Default Mano Rotation
-            dim = step_parity
-
-        decoupled_wd = None
-        if rescaled_lora_wd:
-            if R > C:
-                dec = 0
-            elif C > R:
-                dec = 1
-            weight_decay = weight_decay * p.shape[dec]
-            decoupled_wd = True
-
-        if p.ndim == 1:
-            # Vectors
-            dim = 0
 
         # Ensure 2D view for Mano operations
         if state.get('factored', False):
@@ -327,6 +296,19 @@ class Mano_adv(torch.optim.Optimizer):
             p_flat = p.view(p.shape[0], -1)
         else:
             p_flat = p
+
+        if p_flat.ndim == 1:
+            # Vectors
+            dim = 0
+        else:
+            R, C = p_flat.shape
+            if rotate_method == 'fixed':
+                dim = 0 if R > C else 1
+            elif rotate_method == 'auto_adjusted_ft':
+                dim = 0 if (state['step'] % (R + C)) < R else 1
+            else: # 'auto_ft'
+                # Default Mano Rotation
+                dim = int(state['step'] % 2)
 
         if grad.dtype != torch.float32 and state.get('factored', False):
             grad = grad.float()
@@ -372,11 +354,13 @@ class Mano_adv(torch.optim.Optimizer):
                 momentum_update = mt_buf.clone()
 
         # Apply Mano Geometric Projection
-        update_flat = mano_orthogonalization(p_flat, momentum_update, dim, mano_eps)
+        update_flat = mano_orthogonalization(p_flat, momentum_update, dim)
+
+        # Apply Mano-RMS Rescaling
         update_flat = mano_rms_rescaling(p_flat, update_flat, dim, lr)
         update = update_flat.view(p.shape)
 
-        param_update.apply_parameter_update(self, p, group, update, lr=1.0, wd=weight_decay, random_int_tensor=random_int_tensor, decoupled=decoupled_wd)
+        param_update.apply_parameter_update(self, p, group, update, lr=1.0, wd=weight_decay, random_int_tensor=random_int_tensor)
 
     @torch.no_grad()
     def step(self, closure=None):

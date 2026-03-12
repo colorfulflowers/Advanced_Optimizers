@@ -381,9 +381,9 @@ class Mano_adv(torch.optim.Optimizer):
                 momentum_update = mt_buf.clone()
 
         # Apply Mano Geometric Projection
-        update_flat = mano_orthogonalization(p_flat, momentum_update, dim)
+        update_flat = mano_orthogonalization(p_flat, momentum_update, dim, group.get('n_layers'))
 
-        if group.get('scaled_optm', False) and p.ndim != 1:
+        if group.get('scaled_optm', False) and is_spectral(p):
             # Spectral normalization
             update = update_flat.view(p.shape)
             update = spectral_normalization(update, vector_state=state.get('spectral_v'), lr=lr)

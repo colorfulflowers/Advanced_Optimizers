@@ -9,7 +9,7 @@ def apply_sr_sinkhorn(update: torch.Tensor, iters: int = 5) -> torch.Tensor:
     
     This technique normalizes a 2D matrix alternatively by its row-wise L2 norm 
     and column-wise L2 norm, driving it toward a fixed point that uniformly 
-    distributes update magnitudes, effectively replacing EMA state dependencies.
+    distributes update magnitudes.
     """
     original_shape = update.shape
 
@@ -21,7 +21,7 @@ def apply_sr_sinkhorn(update: torch.Tensor, iters: int = 5) -> torch.Tensor:
             # Fallback to standard L2 normalization scaled by sqrt(dim)
             # This matches the Frobenius norm of a signed vector / Sinkhorn output.
             norm = update.norm(p=2).clamp_min_(1e-12)
-            return update.div_(norm).mul_(math.sqrt(update.numel()))
+            return update.mul_(math.sqrt(update.numel()) / norm)
 
         # View as 2D for the Sinkhorn operation
         update_2d = update.view(d1, d2)
@@ -30,17 +30,23 @@ def apply_sr_sinkhorn(update: torch.Tensor, iters: int = 5) -> torch.Tensor:
         update_2d = update.view(update.shape[0], -1)
 
     m, n = update_2d.shape
-    sqrt_n = math.sqrt(n)
-    sqrt_m = math.sqrt(m)
+
+    # Dynamically determine the order of normalization based on aspect ratio
+    # Normalizing the longer dimension first aids stability.
+    dim = 0 if m > n else 1
+
+    # Precompute scaling factors. 
+    scale_first = math.sqrt(m) if dim == 0 else math.sqrt(n)
+    scale_second = math.sqrt(n) if dim == 0 else math.sqrt(m)
 
     # In-place alternating Sinkhorn normalization steps
     for _ in range(iters):
-        # 1. Row-wise L2 normalization: X <- sqrt(n) * Q(X)^-1 * X
-        row_norm = update_2d.norm(p=2, dim=1, keepdim=True).clamp_min_(1e-12)
-        update_2d.div_(row_norm).mul_(sqrt_n)
+        # First normalization step
+        norm1 = update_2d.norm(p=2, dim=dim, keepdim=True).clamp_min_(1e-12)
+        update_2d.mul_(scale_first / norm1)
 
-        # 2. Column-wise L2 normalization: X <- sqrt(m) * X * R(X)^-1
-        col_norm = update_2d.norm(p=2, dim=0, keepdim=True).clamp_min_(1e-12)
-        update_2d.div_(col_norm).mul_(sqrt_m)
+        # Second normalization step
+        norm2 = update_2d.norm(p=2, dim=1-dim, keepdim=True).clamp_min_(1e-12)
+        update_2d.mul_(scale_second / norm2)
 
     return update_2d.view(original_shape)

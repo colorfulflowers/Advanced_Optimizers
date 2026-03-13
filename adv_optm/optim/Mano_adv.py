@@ -4,7 +4,7 @@ from typing import Optional, Callable
 
 from ..util import param_update
 from ..util.Muon_util import _is_suitable_for_muon
-from ..util.Mano_util import mano_orthogonalization, mano_rms_rescaling
+from ..util.Mano_util import get_mano_dim, mano_orthogonalization, mano_rms_rescaling
 from ..util.factorization_util import _get_effective_shape, _factorize_state, _reconstruct_state
 from ..util.Kourkoutas import KourkoutasHelper
 from ..util import Muon_AuxAdam
@@ -324,18 +324,7 @@ class Mano_adv(torch.optim.Optimizer):
         else:
             p_flat = p
 
-        if p_flat.ndim == 1:
-            # Vectors
-            dim = 0
-        else:
-            R, C = p_flat.shape
-            if rotate_method == 'fixed':
-                dim = 0 if R > C else 1
-            elif rotate_method == 'auto_adjusted_ft':
-                dim = 0 if (state['step'] % (R + C)) < R else 1
-            else: # 'auto_ft'
-                # Default Mano Rotation
-                dim = int(state['step'] % 2)
+        dim = get_mano_dim(p_flat, rotate_method, state['step'])
 
         if grad.dtype != torch.float32 and state.get('factored', False):
             grad = grad.float()

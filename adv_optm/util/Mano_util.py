@@ -58,3 +58,29 @@ def mano_rms_rescaling(
 
     # Apply learning rate
     return u.mul_(lr * scaling_factor)
+
+def get_mano_dim(p_flat: torch.Tensor, rotate_method: str, step: int) -> int:
+    """
+    Determines the dimension along which to apply Mano orthogonalization.
+    
+    Args:
+        p_flat (torch.Tensor): The flattened parameter tensor (1D or 2D).
+        rotate_method (str): Method to choose the manifold rotation dimension 
+                             ('fixed', 'auto_ft', 'auto_adjusted_ft').
+        step (int): The current optimizer step for the parameter.
+
+    Returns:
+        int: The dimension (0 or 1) to rotate/orthogonalize on.
+    """
+    if p_flat.ndim == 1:
+        # Vectors
+        return 0
+
+    R, C = p_flat.shape
+    if rotate_method == 'fixed':
+        return 0 if R > C else 1
+    elif rotate_method == 'auto_adjusted_ft':
+        return 0 if (step % (R + C)) < R else 1
+    else: # 'auto_ft'
+        # Default Mano Rotation
+        return int(step % 2)

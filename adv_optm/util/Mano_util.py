@@ -2,6 +2,15 @@ import torch
 
 import math
 
+def _pseudo_rand(step: int, R: int, C: int) -> float:
+    """Fast deterministic random, returning float in [0, 1]"""
+    # Use python's arbitrarily large integers; bitwise masking ensures it mimics C's 32-bit unsigned math
+    seed = (step * 3141592653) ^ (R * 2718281829) ^ (C * 161803398)
+    seed = ((seed ^ (seed >> 16)) * 0x85ebca6b) & 0xFFFFFFFF
+    seed = ((seed ^ (seed >> 13)) * 0xc2b2ae35) & 0xFFFFFFFF
+    seed = (seed ^ (seed >> 16)) & 0xFFFFFFFF
+    return seed / 4294967295.0
+
 @torch.no_grad()
 def mano_orthogonalization(
     p: torch.Tensor,
@@ -59,15 +68,16 @@ def mano_rms_rescaling(
     # Apply learning rate
     return u.mul_(lr * scaling_factor)
 
-def get_mano_dim(p_flat: torch.Tensor, rotate_method: str, step: int) -> int:
+def get_mano_dim(p_flat: torch.Tensor, rotate_method: str, step: int, state: dict | None = None) -> int:
     """
     Determines the dimension along which to apply Mano orthogonalization.
     
     Args:
         p_flat (torch.Tensor): The flattened parameter tensor (1D or 2D).
         rotate_method (str): Method to choose the manifold rotation dimension 
-                             ('fixed', 'auto_ft', 'auto_adjusted_ft').
+                             ('fixed', 'auto_ft', 'auto_adjusted_ft', 'stochastic_adjusted_ft', 'accum_stochastic_adjusted_ft').
         step (int): The current optimizer step for the parameter.
+        state (dict, optional): The optimizer state dict for the parameter (needed for accum_stochastic_adjusted_ft).
 
     Returns:
         int: The dimension (0 or 1) to rotate/orthogonalize on.
@@ -81,6 +91,31 @@ def get_mano_dim(p_flat: torch.Tensor, rotate_method: str, step: int) -> int:
         return 0 if R > C else 1
     elif rotate_method == 'auto_adjusted_ft':
         return 0 if (step % (R + C)) < R else 1
+    elif rotate_method == 'stochastic_adjusted_ft':
+        rand_val = _pseudo_rand(step, R, C)
+        return 0 if rand_val < (R / (R + C)) else 1
+    elif rotate_method == 'accum_stochastic_adjusted_ft':
+        minor_dim = 1 if C <= R else 0
+        major_dim = 1 - minor_dim
+        minor_prob = min(R, C) / (R + C)
+
+        if state is not None:
+            if 'mano_accum_prob' not in state:
+                state['mano_accum_prob'] = minor_prob
+            current_prob = state['mano_accum_prob']
+        else:
+            current_prob = minor_prob
+
+        rand_val = _pseudo_rand(step, R, C)
+
+        if rand_val < current_prob:
+            # Hit minority dimension, reset probability
+            state['mano_accum_prob'] = minor_prob
+            return minor_dim
+        else:
+            # Missed minority dimension, accumulate probability for next steps
+            state['mano_accum_prob'] += minor_prob
+            return major_dim
     else: # 'auto_ft'
         # Default Mano Rotation
         return int(step % 2)

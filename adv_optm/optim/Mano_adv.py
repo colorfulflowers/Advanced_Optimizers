@@ -38,11 +38,13 @@ class Mano_adv(torch.optim.Optimizer):
         use_mano (bool | None): whether to use Mano or AuxAdamW. MUST be provided either here or via `optim_type`.
         Simplified_AdEMAMix (bool): whether to use the Simplified AdEMAMix update rule for momentum. (default: False).
         alpha_grad (float): Mixing coefficient for Simplified AdEMAMix. (default: 100.0).
-        rotate_method (str): Method to choose the manifold rotation dimension ('fixed', 'auto_ft', 'auto_adjusted_ft').
+        rotate_method (str): Method to choose the manifold rotation dimension ('fixed', 'auto_ft', 'auto_adjusted_ft', 'stochastic_adjusted_ft', 'accum_stochastic_adjusted_ft').
             1. 'fixed': Rotates on the largest dim.
             2. 'auto_ft': original Mano rotation on Arbitrary dim.
             3. 'auto_adjusted_ft': Adjust the dimension rotation frequency according to their sizes, i.e., if one axis is X times larger, choose this axis X times more frequently in Mano.
-            (default: 'auto_ft').
+            4. 'stochastic_adjusted_ft': Stochastic version of auto_adjusted_ft using deterministic pseudo-randomness.
+            5. 'accum_stochastic_adjusted_ft': Accumulates the probability of the minority dimension until it triggers, then resets.
+            (default: 'auto_adjusted_ft').
         centered_wd (float): Centered Weight Decay coefficient. Instead of decaying weights
             toward zero, they are decayed toward their initial values (anchors). This
             can be used together with standard weight decay. (default: 0.0)
@@ -234,6 +236,9 @@ class Mano_adv(torch.optim.Optimizer):
                 state['momentum_buffer'] = torch.zeros_like(p)
 
             state['step'] = 0
+
+            R, C = p.shape
+            state['mano_accum_prob'] = min(R, C) / (R + C)
             
             group['adam_kourkoutas_beta'] = False
             state['is_mano'] = True 
@@ -324,7 +329,7 @@ class Mano_adv(torch.optim.Optimizer):
         else:
             p_flat = p
 
-        dim = get_mano_dim(p_flat, rotate_method, state['step'])
+        dim = get_mano_dim(p_flat, rotate_method, state['step'], state)
 
         if grad.dtype != torch.float32 and state.get('factored', False):
             grad = grad.float()

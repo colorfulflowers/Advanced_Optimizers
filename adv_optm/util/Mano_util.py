@@ -2,15 +2,6 @@ import torch
 
 import math
 
-def _pseudo_rand(step: int, R: int, C: int) -> float:
-    """Fast deterministic random, returning float in [0, 1]"""
-    # Use python's arbitrarily large integers; bitwise masking ensures it mimics C's 32-bit unsigned math
-    seed = (step * 3141592653) ^ (R * 2718281829) ^ (C * 161803398)
-    seed = ((seed ^ (seed >> 16)) * 0x85ebca6b) & 0xFFFFFFFF
-    seed = ((seed ^ (seed >> 13)) * 0xc2b2ae35) & 0xFFFFFFFF
-    seed = (seed ^ (seed >> 16)) & 0xFFFFFFFF
-    return seed / 4294967295.0
-
 @torch.no_grad()
 def mano_orthogonalization(
     p: torch.Tensor,
@@ -29,14 +20,7 @@ def mano_orthogonalization(
 
     # Project momentum onto Tangent Space
     # p_unit = p / ||p||
-    if n_layers is None:
-        p_norm = torch.norm(p, p=2, dim=dim, keepdim=True).clamp_min_(1e-12)
-    else:
-        # Scale-invariant eps
-        n_k = p.shape[dim]
-        n_j = p.numel() // n_k
-        eps = (1.0 / n_layers) * math.sqrt(n_k / n_j)
-        p_norm = torch.norm(p, p=2, dim=dim, keepdim=True).add_(eps)
+    p_norm = torch.norm(p, p=2, dim=dim, keepdim=True).clamp_min_(1e-12)
     p_unit = p / p_norm
 
     # dot = <g, p_unit>
@@ -49,6 +33,9 @@ def mano_orthogonalization(
     if n_layers is None:
         tm_norm = torch.norm(tangent_momentum, p=2, dim=dim, keepdim=True).clamp_min_(1e-12)
     else:
+        n_k = p.shape[dim]
+        n_j = p.numel() // n_k
+        eps = (1.0 / n_layers) * math.sqrt(n_k / n_j)
         tm_norm = torch.norm(tangent_momentum, p=2, dim=dim, keepdim=True).add_(eps)
     u = tangent_momentum / tm_norm
     return u
@@ -68,6 +55,15 @@ def mano_rms_rescaling(
     # Apply learning rate
     return u.mul_(lr * scaling_factor)
 
+def _pseudo_rand(step: int, R: int, C: int) -> float:
+    """Fast deterministic random, returning float in [0, 1]"""
+    # Use python's arbitrarily large integers; bitwise masking ensures it mimics C's 32-bit unsigned math
+    seed = (step * 3141592653) ^ (R * 2718281829) ^ (C * 161803398)
+    seed = ((seed ^ (seed >> 16)) * 0x85ebca6b) & 0xFFFFFFFF
+    seed = ((seed ^ (seed >> 13)) * 0xc2b2ae35) & 0xFFFFFFFF
+    seed = (seed ^ (seed >> 16)) & 0xFFFFFFFF
+    return seed / 4294967295.0
+
 def get_mano_dim(p_flat: torch.Tensor, rotate_method: str, step: int, state: dict | None = None) -> int:
     """
     Determines the dimension along which to apply Mano orthogonalization.
@@ -85,6 +81,8 @@ def get_mano_dim(p_flat: torch.Tensor, rotate_method: str, step: int, state: dic
     if p_flat.ndim == 1:
         # Vectors
         return 0
+
+    rotate_method = 'accum_stochastic_adjusted_ft'
 
     R, C = p_flat.shape
     if rotate_method == 'fixed':

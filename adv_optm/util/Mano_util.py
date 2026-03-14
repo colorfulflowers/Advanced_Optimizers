@@ -82,8 +82,6 @@ def get_mano_dim(p_flat: torch.Tensor, rotate_method: str, step: int, state: dic
         # Vectors
         return 0
 
-    rotate_method = 'accum_stochastic_adjusted_ft'
-
     R, C = p_flat.shape
     if rotate_method == 'fixed':
         return 0 if R > C else 1

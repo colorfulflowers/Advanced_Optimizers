@@ -450,7 +450,7 @@ def spectral_norm_update(update: torch.Tensor, vector_state: torch.Tensor, targe
 
     return update
 
-def get_spectral_scaling(shape: torch.Size, n_layers: int):
+def get_spectral_scaling(p, shape: torch.Size, n_layers: int):
     """
     From the paper:
     "Hyperparameter Transfer Enables Consistent Gains of Matrix-Preconditioned Optimizers Across Scales"
@@ -471,7 +471,13 @@ def get_spectral_scaling(shape: torch.Size, n_layers: int):
 
 
     # Scaling for Epsilon (Table 2)
-    L = max(1, n_layers)
+    L =max(1, n_layers)
+
+    if getattr(p, '_is_lora_A', False):
+        # To ensure that the product of the AB LoRA matrices follows 1/L depth scaling,
+        # we can either scale both factors by 1/sqrt(L) or scale only the B factor by 1/L.
+        # The latter is more geometrically sound and has yielded better results.
+        L = 1
 
     # A) Newton-Schulz Damping
     # This ensures the matrix orthogonalization is stable across scales.

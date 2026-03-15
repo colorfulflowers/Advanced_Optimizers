@@ -59,11 +59,11 @@ def apply_parameter_update(
         # Single stochastic rounding at the end
         if random_int_tensor is not None:
             # Compiled path: use the pre-computed random tensor
-            _copy_stochastic_core_(p, p_fp32, random_int_tensor)
+            _copy_stochastic_core_(p, p_fp32, random_int_tensor, inplace=True)
             del random_int_tensor
         else:
             # Uncompiled path: generate randoms inside
-            copy_stochastic_(p, p_fp32)
+            copy_stochastic_(p, p_fp32, inplace=True)
         del p_fp32, update_fp32
 
     else:
@@ -128,12 +128,35 @@ def _get_random_int_for_sr(source: Tensor) -> Tensor:
         generator=generator,
     )
 
-def _copy_stochastic_core_(target: Tensor, source: Tensor, random_int_tensor: Tensor):
+def _get_random_int_for_fp8_sr(source: Tensor) -> Tensor:
     """
-    Core logic for stochastic rounding using a pre-computed random integer tensor.
+    Generates a random int32 tensor for stochastic rounding.
+    This function is not torch.compile-path friendly due to its use of torch.Generator.
+    """
+    global _generators
+    device = source.device
+
+    if device not in _generators:
+        set_seed(device)
+
+    generator = _generators[device]
+
+    # create a random 20 bit integer (FP32 has 23 mantissa bits, FP8 has 3)
+    return torch.randint(
+        size=source.shape,
+        device=source.device,
+        dtype=torch.int32,
+        low=0,
+        high=(1 << 20),
+        generator=generator,
+    )
+
+def _copy_stochastic_core_(target: Tensor, source: Tensor, random_int_tensor: Tensor, inplace: bool = False):
+    """
+    Core logic for BF16 stochastic rounding using a pre-computed random integer tensor.
     This version is designed to be torch.compile-friendly.
     """
-    result = random_int_tensor
+    result = random_int_tensor if inplace else random_int_tensor.clone()
     # add the random number to the lower 16 bit of the mantissa
     result.add_(source.view(dtype=torch.int32))
 
@@ -143,8 +166,23 @@ def _copy_stochastic_core_(target: Tensor, source: Tensor, random_int_tensor: Te
     # copy the higher 16 bit into the target tensor
     target.copy_(result.view(dtype=torch.float32))
 
+def _copy_fp8_stochastic_core_(target: Tensor, source: Tensor, scale: Tensor, random_int_tensor: Tensor, inplace: bool = False):
+    """
+    Core logic for FP8 stochastic rounding using a pre-computed random integer tensor.
+    """
+    scaled_source = source * scale
+    result = random_int_tensor if inplace else random_int_tensor.clone()
 
-def copy_stochastic_(target: Tensor, source: Tensor):
+    # add the random number to the lower 20 bits of the mantissa
+    result.add_(scaled_source.view(dtype=torch.int32))
+
+    # mask off the lower 20 bits of the mantissa
+    result.bitwise_and_(-1048576)  # -1048576 = FFF00000 as a signed int32
+
+    # copy the modified tensor into the FP8 target tensor
+    target.copy_(result.view(dtype=torch.float32).to(torch.float8_e4m3fn))
+
+def copy_stochastic_(target: Tensor, source: Tensor, inplace: bool = False):
     """
     Nerogar's implementation of stochastic rounding in the paper "Revisiting BFloat16 Training"
     (https://arxiv.org/abs/2010.06192). Made deterministic.
@@ -158,9 +196,16 @@ def copy_stochastic_(target: Tensor, source: Tensor):
         source: the target tensor with dtype=float32
     """
     random_int_tensor = _get_random_int_for_sr(source)
-    _copy_stochastic_core_(target, source, random_int_tensor)
+    _copy_stochastic_core_(target, source, random_int_tensor, inplace)
     del random_int_tensor
 
+def copy_fp8_stochastic_(target: Tensor, source: Tensor, scale: Tensor, inplace: bool = False):
+    """
+    Stochastic rounding implementation for FP8 e4m3fn states. Made deterministic.
+    """
+    random_int_tensor = _get_random_int_for_fp8_sr(source)
+    _copy_fp8_stochastic_core_(target, source, scale, random_int_tensor, inplace)
+    del random_int_tensor
 
 def add_stochastic_(input: Tensor, other: Tensor, alpha: float = 1.0):
     """

@@ -24,21 +24,10 @@ def scale_update(
         The scaled update tensor.
     """
     is_dora_scale = getattr(p, '_is_dora_scale', False)
-    is_oft = getattr(p, '_is_oft', False)
 
     # DoRA Magnitude Scales (1D) or 1D Bias/Norm layers
     if is_dora_scale or p.ndim == 1:
         return rms_normalization(update, dim=None, lr=lr)
-
-    # Orthogonal Fine-Tuning (OFT)
-    # This guarantees O(1) update complexity scaling, independent of block sizes.
-    if is_oft:
-        n = update.shape[1]
-        # Calculate block size (b)
-        b = (1 + math.sqrt(1 + 8 * n)) / 2
-        target_norm = math.sqrt(b / 8)
-        scale = target_norm / math.sqrt(n)
-        return rms_normalization(update, dim=1, lr=lr * scale)
 
     # LoRA Factors or Full Finetuning weights
     # Scales update to maintain consistent spectral norm across different layer sizes and ranks.
@@ -105,7 +94,7 @@ def is_spectral(p: torch.Tensor) -> bool:
     if getattr(p, '_is_lora_A', False) or getattr(p, '_is_lora_B', False):
         return True
     if getattr(p, '_is_oft', False) or getattr(p, '_is_dora_scale', False) or p.ndim == 1:
-        return False
+        return True
     return getattr(p, 'is_hidden', True)
 
 @torch.no_grad()

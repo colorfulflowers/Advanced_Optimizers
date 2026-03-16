@@ -122,7 +122,7 @@ class Adopt_adv(torch.optim.Optimizer):
         eps: float = 1e-6,
         # Decoupled/cautious weight decay
         weight_decay: float = 0.0,
-        fisher_wd: bool = False,
+        fisher_wd: bool = True,
         cautious_wd: bool = False,
         # ADOPT clipping
         clip_lambda: Optional[Callable[[int], float]] = lambda step: step**0.25,
@@ -261,6 +261,7 @@ class Adopt_adv(torch.optim.Optimizer):
             self.kourkoutas_helper.maybe_prepare_step(current_step, p.device)
             # Get the dynamic beta2 calculated in prepare_step()
             beta2 = self.kourkoutas_helper.get_beta2(p, group)
+            beta1 = beta2
 
         # State Initialization
         if 'step' not in state:
@@ -272,7 +273,7 @@ class Adopt_adv(torch.optim.Optimizer):
                 or group["factored_2nd"]
             )
 
-            dtype = torch.float32 if state['factored'] else p.dtype
+            dtype = torch.float32
 
             vt_init = grad.pow(2).to(dtype)
             if isinstance(beta2, torch.Tensor) and beta2.dim() > 0:
@@ -346,7 +347,7 @@ class Adopt_adv(torch.optim.Optimizer):
         state['step'] += 1
 
     def _step_parameter(self, p, grad, state, group, lr, beta1, beta2, random_int_tensor):
-        if state['factored'] and grad.dtype != torch.float32:
+        if grad.dtype != torch.float32:
             grad = grad.float()
         if self.orthogonal_gradient:
             grad = _orthogonalize_gradient(p, grad)
@@ -363,6 +364,11 @@ class Adopt_adv(torch.optim.Optimizer):
 
         # Determine if we are using dense first-moments alongside a factored second-order second-moment
         factored_2nd = group.get('factored_2nd', False)
+
+        if group.get('scaled_optm', False):
+            adaptiv_eps = (1.0 / 32) * (1.0 / math.sqrt(p.numel()))
+        else:
+            adaptiv_eps = group['eps']
 
         if state['factored']:
             d1, d2 = state['effective_shape']
@@ -387,13 +393,13 @@ class Adopt_adv(torch.optim.Optimizer):
             if self.use_atan2:
                 normalized_grad = torch.atan2(grad_reshaped, denom, out=denom)
             else:
-                normalized_grad = torch.div(grad_reshaped, denom.add_(group['eps']), out=denom)
+                normalized_grad = torch.div(grad_reshaped, denom.add_(adaptiv_eps), out=denom)
                 if self.clip_lambda is not None:
                     clip_val = self.clip_lambda(state['step'])
                     normalized_grad.clamp_(-clip_val, clip_val)
 
             # ADOPT Step B: Update momentum m_t using normalized gradient
-            if beta1 > 0:
+            if True:
                 if factored_2nd:
                     mt = state['exp_avg'].view(d1, d2)
                 else:
@@ -425,7 +431,7 @@ class Adopt_adv(torch.optim.Optimizer):
 
                 mt_slow.lerp_(normalized_grad, 1.0 - beta3_ema)
 
-                if beta1 > 0:
+                if True:
                     update = update_mt.add_(mt_slow, alpha=alpha)
                     del normalized_grad
                 else:
@@ -439,7 +445,7 @@ class Adopt_adv(torch.optim.Optimizer):
                 update = update_mt.add_(normalized_grad, alpha=alpha_grad)
                 del normalized_grad
             else:
-                if beta1 > 0:
+                if True:
                     update = update_mt
                     del normalized_grad
                 else:
@@ -457,13 +463,13 @@ class Adopt_adv(torch.optim.Optimizer):
             if self.use_atan2:
                 normalized_grad = torch.atan2(grad, denom, out=denom)
             else:
-                normalized_grad = torch.div(grad, denom.add_(group['eps']), out=denom)
+                normalized_grad = torch.div(grad, denom.add_(adaptiv_eps), out=denom)
                 if self.clip_lambda is not None:
                     clip_val = self.clip_lambda(state['step'])
                     normalized_grad.clamp_(-clip_val, clip_val)
 
             # ADOPT Step B: Update momentum m_t
-            if beta1 > 0:
+            if True:
                 mt = state['exp_avg'] # m_{t-1}
                 if self.Simplified_AdEMAMix:
                     mt.mul_(beta1).add_(normalized_grad, alpha=1.0)
@@ -480,7 +486,7 @@ class Adopt_adv(torch.optim.Optimizer):
             if self.use_AdEMAMix:
                 m_slow = state['exp_avg_slow']
                 m_slow.lerp_(normalized_grad, 1.0 - beta3_ema)
-                if beta1 > 0:
+                if True:
                     update = update_mt.add_(m_slow, alpha=alpha)
                     del normalized_grad
                 else:
@@ -488,7 +494,7 @@ class Adopt_adv(torch.optim.Optimizer):
             elif self.Simplified_AdEMAMix:
                 update = update_mt.add_(normalized_grad, alpha=alpha_grad)
             else:
-                if beta1 > 0:
+                if True:
                     update = update_mt
                     del normalized_grad
                 else:

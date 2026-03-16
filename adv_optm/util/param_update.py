@@ -44,7 +44,7 @@ def _apply_weight_decay(
     # Centered Weight Decay (pulls toward anchor)
     if scaled_cwd is not None and 'anchor_type' in state:
         anchor = dequantize_anchor(p, state, group, p_calc.dtype)
-        decay_target = p_calc.sub(anchor)
+        decay_target = p_calc - anchor
 
         if cautious:
             # Cautious Weight Decay: only decay if the update pushes in the same direction as the decay

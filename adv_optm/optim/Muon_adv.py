@@ -6,6 +6,7 @@ from ..util.factorization_util import _get_effective_shape, _factorize_state, _r
 from ..util.OrthoGrad import _orthogonalize_gradient
 from ..util.Kourkoutas import KourkoutasHelper
 from ..util import Muon_AuxAdam
+from ..util.state_util import init_state_tensor, get_state, set_state
 
 class Muon_adv(torch.optim.Optimizer):
     """
@@ -47,7 +48,7 @@ class Muon_adv(torch.optim.Optimizer):
         vector_reshape (bool): whether to reshape 1D vectors into 2D
             matrices to apply low-rank compression (default: True).
         nnmf_factor (bool): whether to use the factorization or disable it to use
-            the uncompressed optimizer. (default: False)
+            the uncompressed optimizer. Legacy fallback. (default: False)
         use_muon (bool | None): whether to use Muon or AuxAdamW. MUST be provided
             either here or via `optim_type` in parameter groups. (default: None)
         low_rank_ortho (bool): If True, enables low-rank orthogonalization, which
@@ -73,6 +74,9 @@ class Muon_adv(torch.optim.Optimizer):
             (default: 0.025)
         n_layers (int): The depth of the network (L). Required for optimal epsilon scaling. (default: 1)
         spectral_normalization (bool): Enable explicit spectral normalization using power iteration. (default: False)
+        state_precision (str): Precision for optimizer states. Options: 'auto'
+            (parameter precision), 'fp32', 'factored' (SMMF low-rank FP32), 'bf16_sr' (with
+            stochastic rounding), 'fp8', 'fp8_sr'. (default: 'auto')
         --- Auxiliary AdamW_adv Parameters (used for 'adam' groups) ---
         adam_betas (tuple[float, float]): Betas for the AdamW optimizer part.
         adam_eps (float): Epsilon for the AdamW optimizer part.
@@ -86,7 +90,7 @@ class Muon_adv(torch.optim.Optimizer):
         adam_beta3_ema (float): Beta3 for AdEMAMix.
         adam_alpha (float): Alpha for AdEMAMix.
         adam_kourkoutas_beta (bool): Kourkoutas-β for AdamW.
-        adam_nnmf_factor (bool): 1-bit factored for AdamW.
+        adam_nnmf_factor (bool): 1-bit factored for AdamW. Legacy fallback.
     """
 
     def __init__(
@@ -133,6 +137,8 @@ class Muon_adv(torch.optim.Optimizer):
         # Spectral Normalization
         n_layers: int = 1,
         spectral_normalization: bool = False,
+        # State precision
+        state_precision: str = "auto", # 'fp32', 'factored', 'bf16_sr', 'fp8', 'fp8_sr'.
         # torch.compile
         compiled_optimizer: bool = False,
         # --- AdamW_adv specific parameters ---
@@ -171,6 +177,13 @@ class Muon_adv(torch.optim.Optimizer):
             print("Warning: spectral_normalization is incompatible with rms_rescaling, Disabling rms_rescaling.")
             rms_rescaling = False
 
+        state_precision = state_precision.lower()
+        valid_precisions = {"auto", "fp32", "factored", "bf16_sr", "fp8", "fp8_sr"}
+        if state_precision not in valid_precisions:
+            raise ValueError(f"state_precision must be one of {valid_precisions}. Got {state_precision}")
+        if nnmf_factor:
+            state_precision = 'factored'
+
         defaults = {
             "lr": lr, "beta1": beta1, "weight_decay": weight_decay, "cautious_wd": cautious_wd,
             "nesterov": nesterov, "ns_steps": ns_steps, "ns_eps": ns_eps,
@@ -178,6 +191,7 @@ class Muon_adv(torch.optim.Optimizer):
             "vector_reshape": vector_reshape,  "rms_rescaling": rms_rescaling,
             "Simplified_AdEMAMix": Simplified_AdEMAMix, "alpha_grad": alpha_grad,
             "orthogonal_gradient": orthogonal_gradient,
+            "state_precision": state_precision,
             'compiled_optimizer': compiled_optimizer,
             "use_muon": use_muon,
             # Low-rank Ortho
@@ -221,7 +235,7 @@ class Muon_adv(torch.optim.Optimizer):
                         group['use_muon'] = False
 
             if group.get('use_muon') is None: # Fallback
-                 group['use_muon'] = group.get('optim_type') == 'muon'
+                group['use_muon'] = group.get('optim_type') == 'muon'
 
         self.kourkoutas_helper = None
         if any(group.get('adam_kourkoutas_beta', False) for group in self.param_groups):
@@ -265,11 +279,14 @@ class Muon_adv(torch.optim.Optimizer):
             return
 
         if group['use_muon']:
-
+            req_precision = group['state_precision']
             state['factored'] = (
-                group['nnmf_factor'] and
+                req_precision == 'factored' and
                 not (len(p.shape) == 1 and not group['vector_reshape'])
             )
+            actual_precision = 'auto' if req_precision == 'factored' else req_precision
+            state['actual_state_precision'] = actual_precision
+
             dtype = torch.float32 if state['factored'] else p.dtype
             device = p.device
 
@@ -281,7 +298,7 @@ class Muon_adv(torch.optim.Optimizer):
                 packed_d2 = (d2 + 7) // 8
                 state['sign_buf'] = torch.zeros((d1, packed_d2), dtype=torch.uint8, device=device)
             else:
-                state['momentum_buffer'] = torch.zeros_like(p)
+                init_state_tensor(state, 'momentum_buffer', p.shape, actual_precision, p.device, dtype)
 
             # Spectral Normalization
             if group.get('spectral_normalization', False):
@@ -338,9 +355,18 @@ class Muon_adv(torch.optim.Optimizer):
         is_compiled = group.get('compiled_optimizer', False)
 
         random_int_tensor = None
+        random_int_state_tensor = None
         if p.dtype == torch.bfloat16 and self.stochastic_rounding and is_compiled:
             # Pre-generate random tensor for stochastic rounding if needed.
             random_int_tensor = param_update._get_random_int_for_sr(p)
+            random_int_state_tensor = random_int_tensor
+
+        actual_precision = state.get('actual_state_precision', 'auto')
+        if is_compiled:
+            if actual_precision == 'bf16_sr' and random_int_state_tensor is None:
+                random_int_state_tensor = param_update._get_random_int_for_sr(p)
+            elif actual_precision == 'fp8_sr':
+                random_int_state_tensor = param_update._get_random_int_for_fp8_sr(p)
 
         if not state['is_muon']: # AdamW path
             step = state['step']
@@ -382,14 +408,14 @@ class Muon_adv(torch.optim.Optimizer):
                 lr = group['lr']
                 muon_step_param = self._muon_step_parameter
 
-            muon_step_param(p, grad, state, group, lr, random_int_tensor)
+            muon_step_param(p, grad, state, group, lr, random_int_tensor, random_int_state_tensor)
 
     def compile(self, *args, **kwargs):
         self._compiled_muon_step_parameter = torch.compile(self._muon_step_parameter, *args, **kwargs)
         self._compiled_adam_step_parameter = torch.compile(Muon_AuxAdam._adam_step_parameter, *args, **kwargs)
 
     @torch.no_grad()
-    def _muon_step_parameter(self, p, grad, state, group, lr, random_int_tensor):
+    def _muon_step_parameter(self, p, grad, state, group, lr, random_int_tensor, random_int_state_tensor):
 
 
         beta1 = group['beta1']
@@ -480,11 +506,11 @@ class Muon_adv(torch.optim.Optimizer):
         else: # Standard Muon logic for non-factored tensors
 
             if len(p.shape) >= 2:
-
+                actual_precision = state.get('actual_state_precision', 'auto')
                 original_shape = p.shape
 
                 # Momentum update
-                mt_buf = state['momentum_buffer']
+                mt_buf = get_state(state, 'momentum_buffer', actual_precision)
                 if not Simplified_AdEMAMix:
                     mt_buf.lerp_(grad, 1 - beta1)
                 else:
@@ -498,6 +524,8 @@ class Muon_adv(torch.optim.Optimizer):
                 else:
                     # Standard momentum
                     update = mt_buf.clone()
+                
+                set_state(state, 'momentum_buffer', mt_buf, actual_precision, random_int_state_tensor, inplace=True)
 
                 # Flatten if necessary (e.g., for Conv layers)
                 update = update.flatten(1)

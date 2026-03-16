@@ -26,12 +26,13 @@ def scale_update(
     is_dora_scale = getattr(p, '_is_dora_scale', False)
 
     # DoRA Magnitude Scales (1D) or 1D Bias/Norm layers
-    if is_dora_scale or p.ndim == 1:
+    if is_dora_scale:
+        return l2_normalization(update, dim=None, lr=lr)
+    elif p.ndim == 1:
         return rms_normalization(update, dim=None, lr=lr)
-
     # LoRA Factors or Full Finetuning weights
     # Scales update to maintain consistent spectral norm across different layer sizes and ranks.
-    if p.ndim >= 2:
+    elif p.ndim >= 2:
         return spectral_normalization(update, vector_state, lr)
 
     return update.mul_(lr)

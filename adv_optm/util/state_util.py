@@ -68,7 +68,7 @@ def set_state(state: dict, key: str, value: torch.Tensor, state_precision: str, 
         amax = value.abs().max().clamp_min(1e-12)
         scale = 448.0 / amax
         state[f"{key}_scale"].copy_(scale)
-        state[key].copy_((value * scale).clamp_(min=-448, max=448).to(torch.float8_e4m3fn))
+        state[key].copy_((value * scale).clamp(min=-448, max=448).to(torch.float8_e4m3fn))
 
     else:  # 'auto'
         if state[key] is not value:

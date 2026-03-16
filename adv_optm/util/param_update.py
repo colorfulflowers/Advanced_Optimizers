@@ -180,7 +180,7 @@ def _copy_fp8_stochastic_core_(target: Tensor, source: Tensor, scale: Tensor, ra
     result.bitwise_and_(-1048576)  # -1048576 = FFF00000 as a signed int32
 
     # copy the modified tensor into the FP8 target tensor
-    target.copy_(result.view(dtype=torch.float32).clamp_(min=-448, max=448).to(torch.float8_e4m3fn))
+    target.copy_(result.view(dtype=torch.float32).clamp(min=-448, max=448).to(torch.float8_e4m3fn))
 
 def copy_stochastic_(target: Tensor, source: Tensor, inplace: bool = False):
     """

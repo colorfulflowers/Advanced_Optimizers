@@ -170,7 +170,7 @@ def _copy_fp8_stochastic_core_(target: Tensor, source: Tensor, scale: Tensor, ra
     """
     Core logic for FP8 stochastic rounding using a pre-computed random integer tensor.
     """
-    scaled_source = source * scale
+    scaled_source = (source * scale)
     result = random_int_tensor if inplace else random_int_tensor.clone()
 
     # add the random number to the lower 20 bits of the mantissa
@@ -180,7 +180,7 @@ def _copy_fp8_stochastic_core_(target: Tensor, source: Tensor, scale: Tensor, ra
     result.bitwise_and_(-1048576)  # -1048576 = FFF00000 as a signed int32
 
     # copy the modified tensor into the FP8 target tensor
-    target.copy_(result.view(dtype=torch.float32).to(torch.float8_e4m3fn))
+    target.copy_(result.view(dtype=torch.float32).clamp_(min=-448, max=448).to(torch.float8_e4m3fn))
 
 def copy_stochastic_(target: Tensor, source: Tensor, inplace: bool = False):
     """

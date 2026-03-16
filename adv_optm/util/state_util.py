@@ -26,7 +26,7 @@ def init_state_tensor(state: dict, key: str, shape: tuple, state_precision: str,
 
 def get_state(state: dict, key: str, state_precision: str) -> torch.Tensor:
     """
-    Retrieves the state tensor in float32 for high-precision computation.
+    Retrieves the state tensor.
     """
     tensor = state[key]
     if state_precision in ['fp8', 'fp8_sr']:

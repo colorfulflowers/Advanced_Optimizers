@@ -122,7 +122,7 @@ class Adopt_adv(torch.optim.Optimizer):
         eps: float = 1e-6,
         # Decoupled/cautious weight decay
         weight_decay: float = 0.0,
-        fisher_wd: bool = False,
+        fisher_wd: bool = True,
         cautious_wd: bool = False,
         # ADOPT clipping
         clip_lambda: Optional[Callable[[int], float]] = lambda step: step**0.25,
@@ -150,6 +150,7 @@ class Adopt_adv(torch.optim.Optimizer):
         k_warmup_steps: int = 0,
         k_logging: int = 0,
         layer_key_fn: Optional[Callable] = None,
+        current_step_kb: bool = True,
         # Scaled Optimizer
         scaled_optm: bool = False,
         # Centered WD
@@ -193,7 +194,7 @@ class Adopt_adv(torch.optim.Optimizer):
             "beta3_ema": beta3_ema, "alpha": alpha,
             "alpha_grad": alpha_grad,
             "kourkoutas_beta": kourkoutas_beta, "beta2_min": beta2_min, "ema_alpha": ema_alpha,
-            "tiny_spike": tiny_spike, "k_warmup_steps": k_warmup_steps, "k_logging": k_logging,
+            "tiny_spike": tiny_spike, "k_warmup_steps": k_warmup_steps, "k_logging": k_logging, "current_step_kb": current_step_kb,
             "scaled_optm": scaled_optm,
             "centered_wd": centered_wd,
             "centered_wd_mode": centered_wd_mode,
@@ -214,7 +215,7 @@ class Adopt_adv(torch.optim.Optimizer):
         super().__init__(params, defaults)
 
         if self.kourkoutas_beta:
-            self.kourkoutas_helper = KourkoutasHelper(self)
+            self.kourkoutas_helper = KourkoutasHelper(self, current_step_kb)
 
         if self.stochastic_rounding:
             # For deterministic stochastic rounding, we need to seed the generator
@@ -264,6 +265,7 @@ class Adopt_adv(torch.optim.Optimizer):
             self.kourkoutas_helper.maybe_prepare_step(current_step, p.device)
             # Get the dynamic beta2 calculated in prepare_step()
             beta2 = self.kourkoutas_helper.get_beta2(p, group)
+            beta1 = beta2
 
         # State Initialization
         if 'step' not in state:
@@ -275,7 +277,7 @@ class Adopt_adv(torch.optim.Optimizer):
                 or group["factored_2nd"]
             )
 
-            dtype = torch.float32 if state['factored'] else p.dtype
+            dtype = torch.float32
 
             vt_init = grad.pow(2).to(dtype)
             if isinstance(beta2, torch.Tensor) and beta2.dim() > 0:
@@ -349,7 +351,7 @@ class Adopt_adv(torch.optim.Optimizer):
         state['step'] += 1
 
     def _step_parameter(self, p, grad, state, group, lr, beta1, beta2, random_int_tensor):
-        if state['factored'] and grad.dtype != torch.float32:
+        if grad.dtype != torch.float32:
             grad = grad.float()
         if self.orthogonal_gradient:
             grad = _orthogonalize_gradient(p, grad)
@@ -366,6 +368,8 @@ class Adopt_adv(torch.optim.Optimizer):
 
         # Determine if we are using dense first-moments alongside a factored second-order second-moment
         factored_2nd = group.get('factored_2nd', False)
+
+        is_mt =  group['betas'][0] > 0
 
         adaptive_eps = scale_eps(group, p)
 
@@ -398,7 +402,7 @@ class Adopt_adv(torch.optim.Optimizer):
                     normalized_grad.clamp_(-clip_val, clip_val)
 
             # ADOPT Step B: Update momentum m_t using normalized gradient
-            if beta1 > 0:
+            if is_mt:
                 if factored_2nd:
                     mt = state['exp_avg'].view(d1, d2)
                 else:
@@ -430,7 +434,7 @@ class Adopt_adv(torch.optim.Optimizer):
 
                 mt_slow.lerp_(normalized_grad, 1.0 - beta3_ema)
 
-                if beta1 > 0:
+                if is_mt:
                     update = update_mt.add_(mt_slow, alpha=alpha)
                     del normalized_grad
                 else:
@@ -444,7 +448,7 @@ class Adopt_adv(torch.optim.Optimizer):
                 update = update_mt.add_(normalized_grad, alpha=alpha_grad)
                 del normalized_grad
             else:
-                if beta1 > 0:
+                if is_mt:
                     update = update_mt
                     del normalized_grad
                 else:
@@ -468,7 +472,7 @@ class Adopt_adv(torch.optim.Optimizer):
                     normalized_grad.clamp_(-clip_val, clip_val)
 
             # ADOPT Step B: Update momentum m_t
-            if beta1 > 0:
+            if is_mt:
                 mt = state['exp_avg'] # m_{t-1}
                 if self.Simplified_AdEMAMix:
                     mt.mul_(beta1).add_(normalized_grad, alpha=1.0)
@@ -485,7 +489,7 @@ class Adopt_adv(torch.optim.Optimizer):
             if self.use_AdEMAMix:
                 m_slow = state['exp_avg_slow']
                 m_slow.lerp_(normalized_grad, 1.0 - beta3_ema)
-                if beta1 > 0:
+                if is_mt:
                     update = update_mt.add_(m_slow, alpha=alpha)
                     del normalized_grad
                 else:
@@ -493,7 +497,7 @@ class Adopt_adv(torch.optim.Optimizer):
             elif self.Simplified_AdEMAMix:
                 update = update_mt.add_(normalized_grad, alpha=alpha_grad)
             else:
-                if beta1 > 0:
+                if is_mt:
                     update = update_mt
                     del normalized_grad
                 else:
@@ -525,6 +529,10 @@ class Adopt_adv(torch.optim.Optimizer):
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
+
+        if hasattr(self, 'kourkoutas_helper') and self.kourkoutas_helper is not None:
+            if getattr(self.kourkoutas_helper, 'use_current_step', False):
+                self.kourkoutas_helper.compute_current_step_norms()
 
         for group in self.param_groups:
             for i, p in enumerate(group['params']):

@@ -5,7 +5,7 @@ class KourkoutasHelper:
     """
     A helper class to add layer-wise Kourkoutas-β functionality to a PyTorch optimizer.
     """
-    def __init__(self, optimizer: Optimizer):
+    def __init__(self, optimizer: Optimizer, use_current_step: bool = False):
         # We need a reference to the optimizer to access its param_groups and state
         if not hasattr(optimizer, 'param_groups'):
             raise TypeError("optimizer must be a valid torch.optim.Optimizer instance.")
@@ -15,6 +15,7 @@ class KourkoutasHelper:
         self.layer_info = {}
         self._layer_info_built = False
         self._current_step_prepared = -1
+        self.use_current_step = use_current_step
 
         # Store stats for external logging (e.g., TensorBoard)
         self.last_beta2_stats = {}
@@ -166,12 +167,14 @@ class KourkoutasHelper:
             r_ema_tensor.mul_(ema_alpha).add_(pooled_grad_norm, alpha=1.0 - ema_alpha)
 
             # Calculate Beta2
-            if current_step < k_warmup_steps:
-                beta2 = beta2_max
+            raw = pooled_grad_norm / (r_ema_tensor + tiny_spike)
+            sun = raw / (1.0 + raw)
+            beta2_target = beta2_max - (beta2_max - beta2_min) * sun
+            if k_warmup_steps > 0:
+                weight = min(1.0, current_step / k_warmup_steps)
             else:
-                raw = pooled_grad_norm / (r_ema_tensor + tiny_spike)
-                sun = raw / (1.0 + raw)
-                beta2 = beta2_max - (beta2_max - beta2_min) * sun
+                weight = 1.0
+            beta2 = (1.0 - weight) * beta2_max + weight * beta2_target
 
             # Store the final calculated beta2 in the helper's transient state for this step.
             if isinstance(beta2, torch.Tensor) and beta2.numel() == 1 and not group.get('compiled_optimizer', False):
@@ -198,12 +201,29 @@ class KourkoutasHelper:
         """
         if self._current_step_prepared < current_step:
             self.prepare_step(current_step, device)
-            self._current_step_prepared = current_step
+        self._current_step_prepared = current_step
 
-    def accumulate_gradient_sq_norm(self, p: torch.Tensor, grad: torch.Tensor):
+    def compute_current_step_norms(self):
+        """Computes gradient norms for the current step before beta calculation."""
+        for layer_key in self.layer_state:
+            if 'sum_sq_accumulator' in self.layer_state[layer_key]:
+                if isinstance(self.layer_state[layer_key]['sum_sq_accumulator'], torch.Tensor):
+                    self.layer_state[layer_key]['sum_sq_accumulator'].zero_()
+                else:
+                    self.layer_state[layer_key]['sum_sq_accumulator'] = 0.0
+
+        for group in self.optimizer.param_groups:
+            for p in group['params']:
+                if p.grad is not None:
+                    self.accumulate_gradient_sq_norm(p, p.grad, force=True)
+
+    def accumulate_gradient_sq_norm(self, p: torch.Tensor, grad: torch.Tensor, force: bool = False):
         """
         Accumulates the squared L2 norm of a single gradient for the next step's calculation.
         """
+        if getattr(self, 'use_current_step', False) and not force:
+            return
+
         layer_key = self.optimizer.layer_key_fn(p)
 
         if layer_key in self.layer_info and layer_key in self.layer_state:

@@ -1,6 +1,8 @@
 import torch
 from torch.optim import Optimizer
 
+import math
+
 class KourkoutasHelper:
     """
     A helper class to add layer-wise Kourkoutas-β functionality to a PyTorch optimizer.
@@ -166,8 +168,10 @@ class KourkoutasHelper:
             # Update the persistent EMA tensor in-place.
             r_ema_tensor.mul_(ema_alpha).add_(pooled_grad_norm, alpha=1.0 - ema_alpha)
 
+            _tiny_spike = scale_tiny_spike(group, info['params'])
+
             # Calculate Beta2
-            raw = pooled_grad_norm / (r_ema_tensor + tiny_spike)
+            raw = pooled_grad_norm / (r_ema_tensor + _tiny_spike)
             sun = raw / (1.0 + raw)
             beta2_target = beta2_max - (beta2_max - beta2_min) * sun
             if k_warmup_steps > 0:
@@ -245,3 +249,34 @@ class KourkoutasHelper:
         # The default is the max value, which is correct for unmapped params or edge cases
         beta2_default = group.get('betas', group.get('adam_betas'))[1] if group.get('betas', group.get('adam_betas')) else 0.999
         return self.layer_state.get(layer_key, {}).get('dynamic_beta2', beta2_default)
+
+
+def scale_tiny_spike(group: dict, layer_params: list) -> float:
+    """
+    Derives scale-invariant tiny_spike from the EMA tensor's effective numel.
+
+    The EMA tensor tracks norms at different granularities depending on
+    param type:
+    - standard params:  scalar (sum)        → ema_numel = aggregated
+    - lora_A / OFT:     (out_features, 1)   → ema_numel = out_features
+    - lora_B:           (1, in_features)    → ema_numel = in_features
+
+    tiny_spike = 1 / (n_layers * sqrt(ema_numel))
+
+    For scalar EMA (standard layers), it's the number of gradient elements aggregated into each scalar cell of the EMA tensor
+    For high-rank LoRA/OFT rows, it shrinks appropriately since each
+    row's norm is already a partial, smaller quantity.
+    """
+    if not group.get('scaled_optm', False):
+        return group['tiny_spike']
+
+    p0 = layer_params[0]
+
+    if getattr(p0, '_is_lora_A', False) or getattr(p0, '_is_oft', False):
+        ema_numel = p0.shape[1]          # (1, in_features)
+    elif getattr(p0, '_is_lora_B', False):
+        ema_numel = p0.shape[0]          # (out_features, 1)
+    else:
+        ema_numel = sum(p.numel() for p in layer_params)                    # scalar EMA
+
+    return 1.0 / (group['n_layers'] * math.sqrt(ema_numel))

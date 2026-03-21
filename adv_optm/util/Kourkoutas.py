@@ -36,15 +36,7 @@ class KourkoutasHelper:
             pass
         else:
             # No key function was provided. Default to coarse, shape-based bucketing.
-            self.optimizer.layer_key_fn = lambda p: \
-                (id(p),) if (
-                    getattr(p, '_is_oft', False) or
-                    getattr(p, '_is_lora_A', False) or
-                    getattr(p, '_is_lora_B', False) or
-                    getattr(p, '_is_dora_scale', False)
-                ) else tuple(p.shape)
-            # This ensures that we won't mix embeddings with tokens (1 to 10)
-            # TODO find a better way to safeguard the embeddings
+            self.optimizer.layer_key_fn = lambda p: (id(p),)
 
         for group in self.optimizer.param_groups:
             if not group.get('kourkoutas_beta', False) and not group.get('adam_kourkoutas_beta', False):
@@ -72,6 +64,11 @@ class KourkoutasHelper:
                 shape = (p.shape[0], 1)
             elif getattr(p, '_is_lora_B', False):
                 shape = (1, p.shape[1])
+            elif p.ndim >= 2:
+                if _row_oriented(p):
+                    shape = (p.shape[0],) + (1,) * (p.ndim - 1)   # (out, 1, 1, …)
+                else:
+                    shape = (1, p.shape[1]) + (1,) * (p.ndim - 2)  # (1, in, 1, …)
             else:
                 shape = ()
 
@@ -107,6 +104,11 @@ class KourkoutasHelper:
                 shape = (p.shape[0], 1)
             elif getattr(p, '_is_lora_B', False):
                 shape = (1, p.shape[1])
+            elif p.ndim >= 2:
+                if _row_oriented(p):
+                    shape = (p.shape[0],) + (1,) * (p.ndim - 1)   # (out, 1, 1, …)
+                else:
+                    shape = (1, p.shape[1]) + (1,) * (p.ndim - 2)  # (1, in, 1, …)
             else:
                 shape = ()
 
@@ -242,6 +244,19 @@ class KourkoutasHelper:
                 sq_norm = torch.sum(grad.detach().pow(2), dim=1, keepdim=True).float()
             elif getattr(p, '_is_lora_B', False):
                 sq_norm = torch.sum(grad.detach().pow(2), dim=0, keepdim=True).float()
+            elif grad.ndim >= 2:
+                if _row_oriented(p):
+                    sq_norm = torch.sum(
+                        grad.detach().pow(2),
+                        dim=list(range(1, grad.ndim)),
+                        keepdim=True
+                    ).float()
+                else:
+                    sq_norm = torch.sum(
+                        grad.detach().pow(2),
+                        dim=[0] + list(range(2, grad.ndim)),
+                        keepdim=True
+                    ).float()
             else:
                 sq_norm = torch.sum(grad.detach().pow(2)).float()
 
@@ -256,6 +271,15 @@ class KourkoutasHelper:
         beta2_default = group.get('betas', group.get('adam_betas'))[1] if group.get('betas', group.get('adam_betas')) else 0.999
         return self.layer_state.get(layer_key, {}).get('dynamic_beta2', beta2_default)
 
+def _row_oriented(p: torch.Tensor) -> bool:
+    """
+    True  → per-row EMA,  shape (out, 1, 1, …)
+    False → per-col EMA,  shape (1, in, 1, …)
+    Picks the axis with more elements for maximum resolution.
+    For conv weights (out, in, kH, kW) we compare out vs in only,
+    ignoring spatial dims since kH/kW are rarely the informative axis.
+    """
+    return p.shape[0] >= p.shape[1]
 
 def scale_tiny_spike(group: dict, layer_params: list, tiny_spike: float) -> float:
     """
@@ -277,7 +301,12 @@ def scale_tiny_spike(group: dict, layer_params: list, tiny_spike: float) -> floa
         ema_numel = p0.shape[1] # (1, in_features)
     elif getattr(p0, '_is_lora_B', False):
         ema_numel = p0.shape[0] # (out_features, 1)
+    elif p0.ndim >= 2:
+        if _row_oriented(p0):
+            ema_numel = p0.numel() // p0.shape[0] # elements per row
+        else:
+            ema_numel = p0.numel() // p0.shape[1] # elements per col
     else:
-        ema_numel = sum(p.numel() for p in layer_params) # scalar EMA
+        ema_numel = sum(p.numel() for p in layer_params) # scalar EMA (1-D / bias)
 
     return 1.0 / (L * math.sqrt(ema_numel))

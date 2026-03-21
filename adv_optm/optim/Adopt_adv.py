@@ -126,7 +126,7 @@ class Adopt_adv(torch.optim.Optimizer):
         eps: float = 1e-6,
         # Decoupled/cautious weight decay
         weight_decay: float = 0.0,
-        fisher_wd: bool = False,
+        fisher_wd: bool = True,
         cautious_wd: bool = False,
         # ADOPT clipping
         clip_lambda: Optional[Callable[[int], float]] = lambda step: step**0.25,
@@ -160,11 +160,11 @@ class Adopt_adv(torch.optim.Optimizer):
         centered_wd: float = 0.0,
         centered_wd_mode: str = 'float8',
         # States precision
-        state_precision: str = "auto", # 'fp32', 'factored', 'bf16_sr', 'fp8_sr', 'uint8_sr'.
+        state_precision: str = "uint8_sr", # 'fp32', 'factored', 'bf16_sr', 'fp8_sr', 'uint8_sr'.
         # SMMF factorization (legacy)
         nnmf_factor: bool = False,
         vector_reshape: bool = False,
-        factored_2nd: bool = False,
+        factored_2nd: bool = True,
         # torch.compile
         compiled_optimizer: bool = False,
     ):
@@ -230,7 +230,7 @@ class Adopt_adv(torch.optim.Optimizer):
         super().__init__(params, defaults)
 
         if self.kourkoutas_beta:
-            self.kourkoutas_helper = KourkoutasHelper(self)
+            self.kourkoutas_helper = KourkoutasHelper(self, False)
 
         if self.stochastic_rounding:
             # For deterministic stochastic rounding, we need to seed the generator
@@ -279,6 +279,7 @@ class Adopt_adv(torch.optim.Optimizer):
             self.kourkoutas_helper.maybe_prepare_step(current_step, p.device)
             # Get the dynamic beta2 calculated in prepare_step()
             beta2 = self.kourkoutas_helper.get_beta2(p, group)
+            beta1 = beta2
 
         # State Initialization
         if 'step' not in state:
@@ -398,6 +399,8 @@ class Adopt_adv(torch.optim.Optimizer):
 
         adaptive_eps = scale_eps(group, p)
 
+        is_mt = group['betas'][0] > 0
+
         if state['factored']:
             d1, d2 = state['effective_shape']
             grad_reshaped = grad.view(d1, d2)
@@ -427,7 +430,7 @@ class Adopt_adv(torch.optim.Optimizer):
                     normalized_grad.clamp_(-clip_val, clip_val)
 
             # ADOPT Step B: Update momentum m_t using normalized gradient
-            if beta1 > 0:
+            if is_mt:
                 mt = _reconstruct_state((state['mu_m_nmf'], state['mv_m_nmf'], state['sign'], d2), signed=True)
 
                 if self.Simplified_AdEMAMix:
@@ -451,7 +454,7 @@ class Adopt_adv(torch.optim.Optimizer):
 
                 mt_slow.lerp_(normalized_grad, 1.0 - beta3_ema)
 
-                if beta1 > 0:
+                if is_mt:
                     update = update_mt.add_(mt_slow, alpha=alpha)
                     del normalized_grad
                 else:
@@ -464,7 +467,7 @@ class Adopt_adv(torch.optim.Optimizer):
                 update = update_mt.add_(normalized_grad, alpha=alpha_grad)
                 del normalized_grad
             else:
-                if beta1 > 0:
+                if is_mt:
                     update = update_mt
                     del normalized_grad
                 else:
@@ -496,7 +499,7 @@ class Adopt_adv(torch.optim.Optimizer):
                     normalized_grad.clamp_(-clip_val, clip_val)
 
             # ADOPT Step B: Update momentum m_t
-            if beta1 > 0:
+            if is_mt:
                 mt = get_state(state, 'exp_avg', actual_precision) # m_{t-1}
                 if self.Simplified_AdEMAMix:
                     mt.mul_(beta1).add_(normalized_grad, alpha=1.0)
@@ -515,7 +518,7 @@ class Adopt_adv(torch.optim.Optimizer):
             if self.use_AdEMAMix:
                 m_slow = get_state(state, 'exp_avg_slow', actual_precision)
                 m_slow.lerp_(normalized_grad, 1.0 - beta3_ema)
-                if beta1 > 0:
+                if is_mt:
                     update = update_mt.add_(m_slow, alpha=alpha)
                     del normalized_grad
                 else:
@@ -524,7 +527,7 @@ class Adopt_adv(torch.optim.Optimizer):
             elif self.Simplified_AdEMAMix:
                 update = update_mt.add_(normalized_grad, alpha=alpha_grad)
             else:
-                if beta1 > 0:
+                if is_mt:
                     update = update_mt
                     del normalized_grad
                 else:
@@ -547,7 +550,7 @@ class Adopt_adv(torch.optim.Optimizer):
         update_scaling = lr * A if self.use_atan2 else lr
 
         if group.get('scaled_optm', False):
-            update = scale_update(p, update, update_scaling, vector_state=state.get('spectral_v'))
+            update = scale_update(p, update, update_scaling, vector_state=state.get('spectral_v'), depth=group.get('n_layers', 1))
         else:
             update.mul_(update_scaling)
 
@@ -564,6 +567,8 @@ class Adopt_adv(torch.optim.Optimizer):
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
+
+        self.kourkoutas_helper.compute_current_step_norms()
 
         for group in self.param_groups:
             for i, p in enumerate(group['params']):

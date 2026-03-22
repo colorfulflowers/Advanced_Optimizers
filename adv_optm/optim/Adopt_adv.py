@@ -160,7 +160,7 @@ class Adopt_adv(torch.optim.Optimizer):
         centered_wd: float = 0.0,
         centered_wd_mode: str = 'float8',
         # States precision
-        state_precision: str = "uint8_sr", # 'fp32', 'factored', 'bf16_sr', 'fp8_sr', 'uint8_sr'.
+        state_precision: str = "auto", # 'fp32', 'factored', 'bf16_sr', 'fp8_sr', 'uint8_sr'.
         # SMMF factorization (legacy)
         nnmf_factor: bool = False,
         vector_reshape: bool = False,
@@ -230,7 +230,7 @@ class Adopt_adv(torch.optim.Optimizer):
         super().__init__(params, defaults)
 
         if self.kourkoutas_beta:
-            self.kourkoutas_helper = KourkoutasHelper(self, False)
+            self.kourkoutas_helper = KourkoutasHelper(self, True)
 
         if self.stochastic_rounding:
             # For deterministic stochastic rounding, we need to seed the generator
@@ -280,6 +280,8 @@ class Adopt_adv(torch.optim.Optimizer):
             # Get the dynamic beta2 calculated in prepare_step()
             beta2 = self.kourkoutas_helper.get_beta2(p, group)
             beta1 = beta2
+            # Accumulate current grad's norm for the *next* step
+            self.kourkoutas_helper.accumulate_gradient_sq_norm(p, grad)
 
         # State Initialization
         if 'step' not in state:
@@ -394,8 +396,9 @@ class Adopt_adv(torch.optim.Optimizer):
             alpha_grad = group["alpha_grad"]
 
         if group.get('kourkoutas_beta', False):
-            # Accumulate current grad's norm for the *next* step
-            self.kourkoutas_helper.accumulate_gradient_sq_norm(p, grad)
+            if self.Simplified_AdEMAMix:
+                beta2_max = group['betas'][1]
+                alpha_grad = group["alpha_grad"] * ((1.0 - beta2_max) / (1.0 - beta1))
 
         adaptive_eps = scale_eps(group, p)
 
@@ -464,7 +467,7 @@ class Adopt_adv(torch.optim.Optimizer):
                 del mt_slow
 
             elif self.Simplified_AdEMAMix:
-                update = update_mt.add_(normalized_grad, alpha=alpha_grad)
+                update = update_mt.add_(normalized_grad.mul_(alpha_grad))
                 del normalized_grad
             else:
                 if is_mt:
@@ -525,7 +528,7 @@ class Adopt_adv(torch.optim.Optimizer):
                     update = normalized_grad.add_(m_slow, alpha=alpha)
                 set_state(state, 'exp_avg_slow', m_slow, actual_precision, random_int_state_tensor)
             elif self.Simplified_AdEMAMix:
-                update = update_mt.add_(normalized_grad, alpha=alpha_grad)
+                update = update_mt.add_(normalized_grad.mul_(alpha_grad))
             else:
                 if is_mt:
                     update = update_mt

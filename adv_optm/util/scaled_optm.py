@@ -44,6 +44,8 @@ def scale_update(
     # LoRA Factors or Full Finetuning weights
     # Scales update to maintain consistent spectral norm across different layer sizes and ranks.
     if p.ndim >= 2:
+        if getattr(p, '_is_lora_A', False):
+            depth = 1
         return spectral_normalization(update, vector_state, lr/depth)
 
     return update.mul_(lr)

@@ -61,7 +61,7 @@ class KourkoutasHelper:
         if layer_key not in self.layer_state:
             p = layer_params[0]
             if getattr(p, '_is_oft', False) or getattr(p, '_is_lora_A', False):
-                shape = (p.shape[0],) + (1,) * (p.ndim - 1) 
+                shape = (p.shape[0],) + (1,) * (p.ndim - 1)
             elif getattr(p, '_is_lora_B', False):
                 shape = (1, p.shape[1]) + (1,) * (p.ndim - 2)
             elif p.ndim >= 2:
@@ -101,9 +101,9 @@ class KourkoutasHelper:
         if internal_ema is None:
             p = layer_params[0]
             if getattr(p, '_is_oft', False) or getattr(p, '_is_lora_A', False):
-                shape = (p.shape[0], 1)
+                shape = (p.shape[0],) + (1,) * (p.ndim - 1)   # (out, 1, 1, …)
             elif getattr(p, '_is_lora_B', False):
-                shape = (1, p.shape[1])
+                shape = (1, p.shape[1]) + (1,) * (p.ndim - 2)  # (1, in, 1, …)
             elif p.ndim >= 2:
                 if _row_oriented(p):
                     shape = (p.shape[0],) + (1,) * (p.ndim - 1)   # (out, 1, 1, …)
@@ -211,12 +211,6 @@ class KourkoutasHelper:
 
     def compute_current_step_norms(self):
         """Computes gradient norms for the current step before beta calculation."""
-        if not hasattr(self, 'kourkoutas_helper') or self.kourkoutas_helper is None:
-            return
-
-        if not getattr(self.kourkoutas_helper, 'use_current_step', False):
-            return
-
         for layer_key in self.layer_state:
             if 'sum_sq_accumulator' in self.layer_state[layer_key]:
                 if isinstance(self.layer_state[layer_key]['sum_sq_accumulator'], torch.Tensor):
@@ -241,12 +235,17 @@ class KourkoutasHelper:
         if layer_key in self.layer_info and layer_key in self.layer_state:
             # Accumulate for the *next* step's prepare_step call
             if getattr(p, '_is_oft', False) or getattr(p, '_is_lora_A', False):
-                # Sum everything except the first dimension
-                sq_norm = torch.sum(grad.detach().pow(2), dim=list(range(1, grad.ndim)), keepdim=True).float()
+                sq_norm = torch.sum(
+                    grad.detach().pow(2),
+                    dim=list(range(1, grad.ndim)),
+                    keepdim=True
+                ).float()
             elif getattr(p, '_is_lora_B', False):
-                # Sum dimension 0 and everything from dimension 2 onwards
-                dims_to_sum = [0] + list(range(2, grad.ndim))
-                sq_norm = torch.sum(grad.detach().pow(2), dim=dims_to_sum, keepdim=True).float()
+                    sq_norm = torch.sum(
+                        grad.detach().pow(2),
+                        dim=[0] + list(range(2, grad.ndim)),
+                        keepdim=True
+                    ).float()
             elif grad.ndim >= 2:
                 if _row_oriented(p):
                     sq_norm = torch.sum(

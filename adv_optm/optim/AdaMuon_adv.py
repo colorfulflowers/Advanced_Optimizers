@@ -3,7 +3,8 @@ import torch
 import math
 
 from ..util import param_update
-from ..util.Muon_util import newton_schulz, _is_suitable_for_muon, rms_adjustment, normuon_update, approx_mars, _auto_projection_for_adamuon, spectral_norm_update, get_spectral_scaling
+from ..util.Muon_util import newton_schulz, _is_suitable_for_muon, rms_adjustment, normuon_update, approx_mars, _auto_projection_for_adamuon, get_spectral_scaling
+from ..util.scaled_optm import scale_update, is_spectral, init_spectral_norm, scale_eps
 from ..util.factorization_util import _get_effective_shape, _factorize_state, _reconstruct_state
 from ..util.OrthoGrad import _orthogonalize_gradient
 from ..util.Kourkoutas import KourkoutasHelper
@@ -347,27 +348,8 @@ class AdaMuon_adv(torch.optim.Optimizer):
                 elif len(p.shape) >= 2:
                     state['normuon_v'] = torch.zeros(p.shape[0], device=p.device, dtype=torch.float32)
 
-            # Spectral Normalization
             if group.get('spectral_normalization', False):
-                gen = param_update.get_generator(device)
-
-                # Case A: Factored Muon
-                if state['factored']:
-                    d1, d2 = state['effective_shape']
-                    # We need a vector matching the 'inner' dimension d2
-                    state['spectral_v'] = torch.randn(d2, device=device, dtype=dtype, generator=gen)
-
-                # Case B: Standard Muon (Linear, Conv2d, etc.)
-                elif len(p.shape) >= 2:
-                    # Since Muon performs `update.flatten(1)`, the matrix becomes
-                    # (p.shape[0], product_of_rest).
-                    d_in_flat = p.numel() // p.shape[0]
-
-                    state['spectral_v'] = torch.randn(d_in_flat, device=device, dtype=dtype, generator=gen)
-
-                # Normalize initial vector for stability
-                if 'spectral_v' in state:
-                    state['spectral_v'].div_(state['spectral_v'].norm())
+                init_spectral_norm(group, state, p)
 
             # MARS-M state initialization
             if group.get('approx_mars', False):
@@ -532,7 +514,8 @@ class AdaMuon_adv(torch.optim.Optimizer):
                 low_rank_ortho=group['low_rank_ortho'],
                 ortho_rank=group['ortho_rank'],
                 spectral_normalization=group.get('spectral_normalization', False),
-                compiled=group.get('compiled_optimizer', False)
+                compiled=group.get('compiled_optimizer', False),
+                p=p
             )
 
             if group['normuon_variant']:
@@ -556,7 +539,7 @@ class AdaMuon_adv(torch.optim.Optimizer):
             step_scale = lr * A if group['use_atan2'] and not group['normuon_variant'] else lr
             # Spectral Normalization
             if group.get('spectral_normalization', False):
-                spectral_norm_update(update, state['spectral_v'], spectral_target, step_scale)
+                scale_update(p, update, step_scale, state['spectral_v'], group['n_layers'])
             else:
                 # Factored RMS-aligned scaling
                 rms_adjustment(update, group['rms_rescaling'], step_scale)
@@ -597,7 +580,8 @@ class AdaMuon_adv(torch.optim.Optimizer):
                 low_rank_ortho=group['low_rank_ortho'],
                 ortho_rank=group['ortho_rank'],
                 spectral_normalization=group.get('spectral_normalization', False),
-                compiled=group.get('compiled_optimizer', False)
+                compiled=group.get('compiled_optimizer', False),
+                p=p
             )
 
             # NorMuon Logic
@@ -621,7 +605,7 @@ class AdaMuon_adv(torch.optim.Optimizer):
 
             if group.get('spectral_normalization', False):
                 # Spectral Normalization
-                spectral_norm_update(update, state['spectral_v'], spectral_target, step_scale)
+                scale_update(p, update, step_scale, state['spectral_v'], group['n_layers'])
             else:
                 # RMS-aligned rescaling
                 rms_adjustment(update, group['rms_rescaling'], step_scale)

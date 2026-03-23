@@ -203,7 +203,7 @@ class KourkoutasHelper:
             if use_kb1:
                 beta1_max = betas_tuple[0]
                 # beta1_min falls back to beta2_min when not explicitly provided
-                beta1_min = 0.8
+                beta1_min = 0.9
 
                 beta1_target = beta1_max - (beta1_max - beta1_min) * sun
                 beta1 = (1.0 - weight) * beta1_max + weight * beta1_target
@@ -346,7 +346,7 @@ def scale_tiny_spike(group: dict, layer_params: list, tiny_spike: float) -> floa
         # No depth scaling for:
         # - lora_A: non-zero init, different gradient dynamics than B
         # - 1D params (biases, norms, DoRA scales): additive, don't compound through depth.
-        L = 1
+        L = group['n_layers']
     else:
         L = group['n_layers']
 

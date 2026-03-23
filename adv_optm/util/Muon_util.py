@@ -3,6 +3,160 @@ import torch
 import math
 
 @torch.no_grad()
+def _lora_newton_schulz_iteration(
+    X: torch.Tensor,
+    pair: torch.Tensor,
+    is_lora_A: bool,
+    steps: int = 5,
+    eps: float = 1e-7,
+    coeffs: tuple[float, float, float] = (3.4445, -4.7750, 2.0315),
+    cns: bool = False,
+    cns_a_bound: float = 1e-4,
+    spectral_normalization: bool = False,
+) -> torch.Tensor:
+    """
+    Computes efficient Newton-Schulz orthogonalization directly in the full combined weight space
+    of the two LoRA factors without ever materializing the `d_out * d_in` full product.
+    Operates on O(r^2) metrics. 
+    """
+    dtype = X.dtype
+    X_f = X.to(torch.float32)
+    pair_f = pair.to(torch.float32)
+
+    if is_lora_A:
+        M_L = pair_f.mT @ pair_f # (r, r)
+        M_R = X_f @ X_f.mT # (r, r)
+    else:
+        M_L = X_f.mT @ X_f # (r, r)
+        M_R = pair_f @ pair_f.mT # (r, r)
+
+    r = M_L.size(0)
+
+    # Frobenius norm squared of the combined matrix L @ R is exactly Tr(M_L @ M_R)
+    frob_norm_sq = torch.sum(M_L * M_R).clamp_min_(1e-12)
+    frob_norm = frob_norm_sq.sqrt()
+
+    if spectral_normalization:
+        scale = 1.0 / (frob_norm + eps)
+    else:
+        scale = 1.0 / frob_norm.clamp_min(eps)
+
+    # Scale inner component matrices so the synthesized combined matrix receives `scale`
+    M_L.mul_(scale)
+    M_R.mul_(scale)
+
+    P = torch.eye(r, device=X.device, dtype=torch.float32)
+
+    if cns:
+        lower_bound = cns_a_bound
+        upper_bound = 1.0
+        for _ in range(steps):
+            lb, ub = lower_bound, upper_bound
+            lb_ub = lb * ub
+            e_sq = (lb**2 + lb_ub + ub**2) / 3.0
+            K = 2.0 * e_sq**1.5
+            L = lb_ub * (lb + ub)
+            denom = K + L
+            alpha = 6.0 / denom
+            c1 = alpha * e_sq
+            c3 = -alpha / 3.0
+
+            # Construct the combined scaled inner projection
+            A_k = P @ M_R @ P.mT @ M_L
+            P = c1 * P + c3 * (A_k @ P)
+
+            eps_val = (K - L) / denom
+            lower_bound, upper_bound = 1.0 - eps_val, 1.0 + eps_val
+    else:
+        a, b, c = coeffs
+        for _ in range(steps):
+            A_k = P @ M_R @ P.mT @ M_L
+            A_k_P = A_k @ P
+            P = a * P + b * A_k_P + c * (A_k @ A_k_P)
+
+    P.mul_(scale)
+
+    # Project factored updates mapping dynamically onto correct active component
+    if is_lora_A:
+        return (P.to(dtype) @ X)
+    else:
+        return (X @ P.to(dtype))
+
+@torch.no_grad()
+def _compiled_lora_newton_schulz_iteration(
+    X: torch.Tensor,
+    pair: torch.Tensor,
+    is_lora_A: bool,
+    steps: int = 5,
+    eps: float = 1e-7,
+    coeffs: tuple[float, float, float] = (3.4445, -4.7750, 2.0315),
+    cns: bool = False,
+    cns_a_bound: float = 1e-4,
+    spectral_normalization: bool = False,
+) -> torch.Tensor:
+    """
+    Compiled version of LoRA Newton-Schulz orthogonalization voiding in-place mutations.
+    """
+    dtype = X.dtype
+    X_f = X.to(torch.float32)
+    pair_f = pair.to(torch.float32)
+
+    if is_lora_A:
+        M_L = pair_f.mT @ pair_f
+        M_R = X_f @ X_f.mT
+    else:
+        M_L = X_f.mT @ X_f
+        M_R = pair_f @ pair_f.mT
+
+    r = M_L.size(0)
+
+    frob_norm_sq = torch.sum(M_L * M_R).clamp_min(1e-12)
+    frob_norm = frob_norm_sq.sqrt()
+
+    if spectral_normalization:
+        scale = 1.0 / (frob_norm + eps)
+    else:
+        scale = 1.0 / frob_norm.clamp_min(eps)
+    
+    M_L = M_L * scale
+    M_R = M_R * scale
+
+    P = torch.eye(r, device=X.device, dtype=torch.float32)
+
+    if cns:
+        lower_bound = cns_a_bound
+        upper_bound = 1.0
+        for _ in range(steps):
+            lb, ub = lower_bound, upper_bound
+            lb_ub = lb * ub
+            e_sq = (lb**2 + lb_ub + ub**2) / 3.0
+            K = 2.0 * e_sq**1.5
+            L = lb_ub * (lb + ub)
+            denom = K + L
+            alpha = 6.0 / denom
+            c1 = alpha * e_sq
+            c3 = -alpha / 3.0
+            
+            A_k = P @ M_R @ P.mT @ M_L
+            P = c1 * P + c3 * (A_k @ P)
+            
+            eps_val = (K - L) / denom
+            lower_bound, upper_bound = 1.0 - eps_val, 1.0 + eps_val
+    else:
+        a, b, c = coeffs
+        for _ in range(steps):
+            A_k = P @ M_R @ P.mT @ M_L
+            A_k_P = A_k @ P
+            P = a * P + b * A_k_P + c * (A_k @ A_k_P)
+
+    P = P * scale
+
+    if is_lora_A:
+        return (P.to(dtype) @ X)
+    else:
+        return (X @ P.to(dtype))
+
+@torch.no_grad()
 def _newton_schulz_iteration(
     G: torch.Tensor,
     steps: int = 5,
@@ -207,6 +361,7 @@ def newton_schulz(
     ortho_rank: int = 128,
     spectral_normalization: bool = False,
     compiled: bool = False,
+    p: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Public entry point for Muon orthogonalization.
@@ -224,6 +379,29 @@ def newton_schulz(
         low_rank_ortho (bool): Whether to project to low rank before orthogonalizing.
         ortho_rank (int): Rank for low-rank projection.
     """
+    # Guard trigger: Apply pair-aware LoRA Full-Weight Orthogonalization matching if valid parameter is passed.
+    if p is not None:
+        is_lora_A = getattr(p, '_is_lora_A', False)
+        is_lora_B = getattr(p, '_is_lora_B', False)
+        if is_lora_A or is_lora_B:
+            pair = getattr(p, '_lora_pair', None)
+            if pair is not None:
+                # Same explicit zero-initialization gating applied natively in scaled_optm.py for stabilization
+                sigma_pair = pair.detach().norm()
+                if sigma_pair > 1e-4:
+                    lora_ns_fn = _compiled_lora_newton_schulz_iteration if compiled else _lora_newton_schulz_iteration
+                    return lora_ns_fn(
+                        G,
+                        pair=pair.detach(),
+                        is_lora_A=is_lora_A,
+                        steps=steps,
+                        eps=eps,
+                        coeffs=coeffs,
+                        cns=cns,
+                        cns_a_bound=cns_a_bound,
+                        spectral_normalization=spectral_normalization
+                    )
+
     if compiled:
         ns_fn = _compiled_newton_schulz_iteration
     else:
@@ -409,46 +587,6 @@ def _auto_projection_for_adamuon(raw_update: torch.Tensor, kappa_p: float) -> to
     den = x.norm(p=p).pow_(p - 1).clamp_min_(EPS)
     return num.div_(den)
 
-@torch.no_grad()
-def spectral_norm_update(update: torch.Tensor, vector_state: torch.Tensor, target_scale: float, lr):
-    """
-    From the paper:
-    "Hyperparameter Transfer Enables Consistent Gains of Matrix-Preconditioned Optimizers Across Scales"
-    Applies explicit Spectral Normalization (Section F of the paper).
-    Rescales the update A_t to (target_scale * A_t / sigma_t).
-
-    Args:
-        update: The optimizer update matrix (A_t).
-        vector_state: The persistent vector for power iteration (v_t).
-        target_scale: sqrt(d_out / d_in).
-    """
-    # Power Iteration to estimate spectral norm
-    # u = A @ v
-    u = torch.mv(update, vector_state)
-
-    # v_new = A.T @ u
-    v_new = torch.mv(update.mT, u)
-
-    # Normalize v_new to get next state
-    v_norm = torch.linalg.vector_norm(v_new)
-
-    # if v_norm >= 0.5:
-    #    vector_state.copy_(v_new.div_(v_norm.clamp_min_(1e-12))).to(vector_state.dtype))
-    candidate_v = v_new / v_norm
-    next_state = torch.where(v_norm >= 0.5, candidate_v, vector_state)
-    vector_state.copy_(next_state.to(vector_state.dtype))
-    # Else: We keep the old vector_state (which is a random unit vector at init)
-
-    # Estimate sigma = ||A @ v|| (since v is unit norm)
-    # Re-compute A @ v_new with the updated vector for better estimate
-    Av = torch.mv(update, vector_state)
-    sigma = torch.linalg.vector_norm(Av)
-
-    # Rescale update
-    # A_new = target_scale * A / sigma
-    update.mul_(lr * (target_scale / sigma.clamp_min_(1e-12)))
-
-    return update
 
 def get_spectral_scaling(p, shape: torch.Size, n_layers: int):
     """
@@ -469,6 +607,15 @@ def get_spectral_scaling(p, shape: torch.Size, n_layers: int):
     if len(shape) > 2:
         d_in = shape[1:].numel()
 
+    # Overwrite with full layer dimensions if part of a LoRA pair
+    pair = getattr(p, '_lora_pair', None)
+    if pair is not None:
+        if getattr(p, '_is_lora_B', False):
+            d_out = p.shape[0]
+            d_in  = pair.numel() // pair.shape[0]
+        else:  # _is_lora_A
+            d_in  = p.numel() // p.shape[0]
+            d_out = pair.shape[0]
 
     # Scaling for Epsilon (Table 2)
     L = max(1, n_layers)
@@ -481,12 +628,7 @@ def get_spectral_scaling(p, shape: torch.Size, n_layers: int):
     # B) Adaptive Denominator Epsilon
     # This ensures the Adam-style division doesn't explode or vanish.
     # Formula: (1/L) * (1 / sqrt(d_in * d_out))
-    if getattr(p, '_is_lora_A', False):
-        # Apply 1/depth only to B factor (zero init)
-        # To achieve O(1)
-        adaptive_eps = (1.0 / math.sqrt(d_in * d_out))
-    else:
-        adaptive_eps = (1.0 / L) * (1.0 / math.sqrt(d_in * d_out))
+    adaptive_eps = (1.0 / L) * (1.0 / math.sqrt(d_in * d_out))
 
     # Spectral Target (Section F) -> sqrt(d_out/d_in)
     spectral_target = math.sqrt(d_out / d_in)

@@ -1,7 +1,8 @@
 import torch
 
 from ..util import param_update
-from ..util.Muon_util import newton_schulz, _is_suitable_for_muon, rms_adjustment, normuon_update, approx_mars, spectral_norm_update, get_spectral_scaling
+from ..util.Muon_util import newton_schulz, _is_suitable_for_muon, rms_adjustment, normuon_update, approx_mars, get_spectral_scaling
+from ..util.scaled_optm import scale_update, init_spectral_norm
 from ..util.factorization_util import _get_effective_shape, _factorize_state, _reconstruct_state
 from ..util.OrthoGrad import _orthogonalize_gradient
 from ..util.Kourkoutas import KourkoutasHelper
@@ -315,25 +316,7 @@ class Muon_adv(torch.optim.Optimizer):
 
             # Spectral Normalization
             if group.get('spectral_normalization', False):
-                gen = param_update.get_generator(device)
-
-                # Case A: Factored Muon
-                if state['factored']:
-                    d1, d2 = state['effective_shape']
-                    # We need a vector matching the 'inner' dimension d2
-                    state['spectral_v'] = torch.randn(d2, device=device, dtype=dtype, generator=gen)
-
-                # Case B: Standard Muon (Linear, Conv2d, etc.)
-                elif len(p.shape) >= 2:
-                    # Since Muon performs `update.flatten(1)`, the matrix becomes
-                    # (p.shape[0], product_of_rest).
-                    d_in_flat = p.numel() // p.shape[0]
-
-                    state['spectral_v'] = torch.randn(d_in_flat, device=device, dtype=dtype, generator=gen)
-
-                # Normalize initial vector for stability
-                if 'spectral_v' in state:
-                    state['spectral_v'].div_(state['spectral_v'].norm())
+                init_spectral_norm(group, state, p)
 
             # MARS-M state initialization
             if group.get('approx_mars', False):
@@ -436,7 +419,7 @@ class Muon_adv(torch.optim.Optimizer):
             else:
                 shape_for_scaling = p.shape
 
-            scaled_eps, _, spectral_target, wd_scale = get_spectral_scaling(p, shape_for_scaling, group['n_layers'])
+            scaled_eps, _, _, wd_scale = get_spectral_scaling(p, shape_for_scaling, group['n_layers'])
 
             weight_decay = group['weight_decay'] * wd_scale
             decoupled_wd = True
@@ -502,7 +485,7 @@ class Muon_adv(torch.optim.Optimizer):
 
             if group.get('spectral_normalization', False):
                 # Spectral Normalization
-                spectral_norm_update(update, state['spectral_v'], spectral_target, lr)
+                scale_update(p, update, lr, state['spectral_v'], group['n_layers'])
             else:
                 # Factored RMS-aligned scaling
                 rms_adjustment(update, group['rms_rescaling'], lr)
@@ -554,7 +537,7 @@ class Muon_adv(torch.optim.Optimizer):
 
                 if group.get('spectral_normalization', False):
                     # Spectral Normalization
-                    spectral_norm_update(update, state['spectral_v'], spectral_target, lr)
+                    scale_update(p, update, lr, state['spectral_v'], group['n_layers'])
                 else:
                     # RMS-aligned rescaling
                     rms_adjustment(update, group['rms_rescaling'], lr)

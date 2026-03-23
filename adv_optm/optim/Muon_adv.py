@@ -477,7 +477,8 @@ class Muon_adv(torch.optim.Optimizer):
                 low_rank_ortho=group['low_rank_ortho'],
                 ortho_rank=group['ortho_rank'],
                 spectral_normalization=group.get('spectral_normalization', False),
-                compiled=group.get('compiled_optimizer', False)
+                compiled=group.get('compiled_optimizer', False),
+                p=p
             )
 
             if group['normuon_variant']:
@@ -528,7 +529,8 @@ class Muon_adv(torch.optim.Optimizer):
                     low_rank_ortho=group['low_rank_ortho'],
                     ortho_rank=group['ortho_rank'],
                     spectral_normalization=group.get('spectral_normalization', False),
-                    compiled=group.get('compiled_optimizer', False)
+                    compiled=group.get('compiled_optimizer', False),
+                p=p
                 )
 
                 # NorMuon Logic

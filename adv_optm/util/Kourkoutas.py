@@ -64,7 +64,7 @@ class KourkoutasHelper:
             if getattr(p, '_is_oft', False) or getattr(p, '_is_lora_A', False):
                 shape = (p.shape[0],) + (1,) * (p.ndim - 1)
             elif getattr(p, '_is_lora_B', False):
-                shape = ()
+                shape = (1, p.shape[1]) + (1,) * (p.ndim - 2)
             elif p.ndim >= 2:
                 if _row_oriented(p):
                     shape = (p.shape[0],) + (1,) * (p.ndim - 1)   # (out, 1, 1, …)
@@ -104,7 +104,7 @@ class KourkoutasHelper:
             if getattr(p, '_is_oft', False) or getattr(p, '_is_lora_A', False):
                 shape = (p.shape[0],) + (1,) * (p.ndim - 1)   # (out, 1, 1, …)
             elif getattr(p, '_is_lora_B', False):
-                shape = ()
+                shape = (1, p.shape[1]) + (1,) * (p.ndim - 2)
             elif p.ndim >= 2:
                 if _row_oriented(p):
                     shape = (p.shape[0],) + (1,) * (p.ndim - 1)   # (out, 1, 1, …)
@@ -275,7 +275,11 @@ class KourkoutasHelper:
                     keepdim=True
                 ).float()
             elif getattr(p, '_is_lora_B', False):
-                    sq_norm = torch.sum(grad.detach().pow(2)).float()
+                    sq_norm = torch.sum(
+                        grad.detach().pow(2),
+                        dim=[0] + list(range(2, grad.ndim)),
+                        keepdim=True
+                    ).float()
             elif grad.ndim >= 2:
                 if _row_oriented(p):
                     sq_norm = torch.sum(
@@ -347,9 +351,9 @@ def scale_tiny_spike(group: dict, layer_params: list, tiny_spike: float) -> floa
         L = group['n_layers']
 
     if getattr(p0, '_is_lora_A', False) or getattr(p0, '_is_oft', False):
-        ema_numel = p0.numel() // p0.shape[0] # (1, in_features)
+        ema_numel = p0.numel() // p0.shape[0] # (1, in_features) - per rank
     elif getattr(p0, '_is_lora_B', False):
-        ema_numel = p0.numel()  # full matrix
+        ema_numel = p0.numel() // p0.shape[1] # (out_features, 1) - per rank
     elif p0.ndim >= 2:
         if _row_oriented(p0):
             ema_numel = p0.numel() // p0.shape[0] # elements per row

@@ -46,8 +46,24 @@ def scale_update(
     if p.ndim >= 2:
         if getattr(p, '_is_lora_A', False):
             rank = p.shape[0]
+            B = getattr(p, '_lora_pair', None)
+            if B is not None:
+                # Symmetric treatment: normalize σ(B @ δA) to full-training target.
+                # Guard: B is zero-initialised; skip until it has meaningful scale.
+                sigma_B = B.detach().norm()
+                if sigma_B > 1e-4:
+                    return spectral_normalization_lora_A(update, B.detach(),
+                                                        vector_state, lr / depth)
             return l2_normalization(update, dim=1, lr=lr / math.sqrt(rank))
-        return spectral_normalization(update, vector_state, lr/depth)
+
+        if getattr(p, '_is_lora_B', False):
+            A = getattr(p, '_lora_pair', None)
+            if A is not None:
+                return spectral_normalization_lora_B(update, A.detach(),
+                                                    vector_state, lr / depth)
+            return spectral_normalization(update, vector_state, lr / depth)
+
+        return spectral_normalization(update, vector_state, lr / depth)
 
     return update.mul_(lr)
 
@@ -57,10 +73,26 @@ def scale_eps(group: dict, p) -> float:
     Scales Adam eps to be scale-invariant.
     """
     if group.get('scaled_optm', False):
-        if getattr(p, '_is_lora_A', False) or getattr(p, '_is_dora_scale', False) or getattr(p, '_is_oft', False) or p.ndim < 2:
-            # No depth scaling for:
-            # - lora_A: non-zero init, different gradient dynamics than B
-            # - 1D params (biases, norms, DoRA scales): additive, don't compound through depth.
+        pair = getattr(p, '_lora_pair', None)
+
+        if pair is not None:
+            # LoRA pair: eps based on effective weight numel (d_out * d_in), not
+            # parameter numel (d_out * rank or rank * d_in).
+            # Both factors jointly represent one weight matrix, so both use the
+            # same formula — consistent with the pair-aware spectral norm and K-β.
+            # Depth scaling applies to both: after the spectral norm fix, the
+            # combined step compounds through depth like any full-rank weight.
+            if getattr(p, '_is_lora_B', False):
+                d_out = p.shape[0]
+                d_in  = pair.numel() // pair.shape[0]
+            else:  # _is_lora_A
+                d_in  = p.numel() // p.shape[0]
+                d_out = pair.shape[0]
+            effective_numel = d_out * d_in
+            adaptive_eps = (1.0 / group['n_layers']) * (1.0 / math.sqrt(effective_numel))
+
+        elif getattr(p, '_is_dora_scale', False) or getattr(p, '_is_oft', False) \
+                or p.ndim < 2:
             adaptive_eps = (1.0 / math.sqrt(p.numel()))
         else:
             adaptive_eps = (1.0 / group['n_layers']) * (1.0 / math.sqrt(p.numel()))
@@ -133,7 +165,16 @@ def is_spectral(p: torch.Tensor) -> bool:
 def init_spectral_norm(group: dict, state: dict, p: torch.Tensor):
     """Initializes the singular vector 'v' for the Power Iteration method."""
     gen = param_update.get_generator(p.device)
-    v = torch.randn(p.numel() // p.shape[0], device=p.device, dtype=p.dtype, generator=gen)
+
+    A = getattr(p, '_lora_pair', None)
+    if getattr(p, '_is_lora_B', False) and A is not None:
+        # v must live in d_in-space of the *combined* product δB @ A,
+        # not in rank-space (p.numel()//p.shape[0] would give rank).
+        v_dim = A.numel() // A.shape[0]   # = d_in of the original layer
+    else:
+        v_dim = p.numel() // p.shape[0]
+
+    v = torch.randn(v_dim, device=p.device, dtype=p.dtype, generator=gen)
     state['spectral_v'] = v.div_(v.norm().clamp_min_(1e-12))
 
 @torch.no_grad()
@@ -169,3 +210,83 @@ def spectral_normalization(update: torch.Tensor, vector_state: torch.Tensor, lr:
     # Rescale update
     scale = lr * (target_scale / sigma.clamp_min_(1e-12))
     return update.mul_(scale)
+
+@torch.no_grad()
+def spectral_normalization_lora_B(
+    update_B: torch.Tensor,
+    A: torch.Tensor,
+    vector_state: torch.Tensor,
+    lr: float,
+) -> torch.Tensor:
+    """
+    Spectral normalization for lora_B using the *combined* weight-space step.
+
+    Never materialises the [d_out, d_in] product. Instead uses the identity:
+        M = δB @ A   (shape [d_out, d_in])
+        M v  = δB @ (A @ v)        — one [rank] mv + one [d_out] mv
+        Mᵀ u = Aᵀ @ (δBᵀ @ u)     — one [rank] mv + one [d_in]  mv
+    This keeps O(rank · (d_out + d_in)) instead of O(d_out · d_in).
+    """
+    d_out = update_B.shape[0]
+    rank  = update_B.numel() // d_out
+    d_in  = vector_state.shape[0]          # set correctly by init_spectral_norm
+
+    dtype = vector_state.dtype
+    B_flat = update_B.view(d_out, rank).to(dtype)
+    A_flat = A.view(rank, d_in).to(dtype)
+
+    # Target matches full training: √(d_out / d_in_orig)
+    target_scale = math.sqrt(d_out / d_in)
+
+    # Power iteration step
+    Av     = torch.mv(A_flat, vector_state)          # [rank]
+    u      = torch.mv(B_flat, Av)                    # [d_out]
+    BTu    = torch.mv(B_flat.mT, u)                  # [rank]
+    v_new  = torch.mv(A_flat.mT, BTu)                # [d_in]
+
+    v_norm = torch.linalg.vector_norm(v_new)
+    candidate_v = v_new / v_norm
+    next_state  = torch.where(v_norm >= 0.5, candidate_v, vector_state)
+    vector_state.copy_(next_state)
+
+    # σ estimate with updated v
+    Av    = torch.mv(A_flat, vector_state)
+    u     = torch.mv(B_flat, Av)
+    sigma = torch.linalg.vector_norm(u)
+
+    scale = lr * (target_scale / sigma.clamp_min_(1e-12))
+    return update_B.mul_(scale)
+
+@torch.no_grad()
+def spectral_normalization_lora_A(
+    update_A: torch.Tensor,
+    B: torch.Tensor,
+    vector_state: torch.Tensor,
+    lr: float,
+) -> torch.Tensor:
+    d_out = B.shape[0]
+    rank  = B.numel() // d_out
+    d_in  = vector_state.shape[0]
+
+    dtype  = vector_state.dtype
+    A_flat = update_A.view(rank, d_in).to(dtype)
+    B_flat = B.view(d_out, rank).to(dtype)
+
+    target_scale = math.sqrt(d_out / d_in)
+
+    Av     = torch.mv(A_flat, vector_state)          # [rank]
+    u      = torch.mv(B_flat, Av)                    # [d_out]
+    BTu    = torch.mv(B_flat.mT, u)                  # [rank]
+    v_new  = torch.mv(A_flat.mT, BTu)                # [d_in]
+
+    v_norm = torch.linalg.vector_norm(v_new)
+    candidate_v = v_new / v_norm
+    next_state  = torch.where(v_norm >= 0.5, candidate_v, vector_state)
+    vector_state.copy_(next_state)
+
+    Av    = torch.mv(A_flat, vector_state)
+    u     = torch.mv(B_flat, Av)
+    sigma = torch.linalg.vector_norm(u)
+
+    scale = lr * (target_scale / sigma.clamp_min_(1e-12))
+    return update_A.mul_(scale)

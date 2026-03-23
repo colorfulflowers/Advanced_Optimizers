@@ -279,7 +279,7 @@ class Adopt_adv(torch.optim.Optimizer):
             self.kourkoutas_helper.maybe_prepare_step(current_step, p.device)
             # Get the dynamic beta2 calculated in prepare_step()
             beta2 = self.kourkoutas_helper.get_beta2(p, group)
-            beta1 = beta2
+            beta1 = self.kourkoutas_helper.get_beta1(p, group)
             # Accumulate current grad's norm for the *next* step
             self.kourkoutas_helper.accumulate_gradient_sq_norm(p, grad)
 
@@ -397,8 +397,8 @@ class Adopt_adv(torch.optim.Optimizer):
 
         if group.get('kourkoutas_beta', False):
             if self.Simplified_AdEMAMix:
-                beta2_max = group['betas'][1]
-                alpha_grad = group["alpha_grad"] * ((1.0 - beta2_max) / (1.0 - beta1))
+                beta1_max = group['betas'][0]
+                alpha_grad = group["alpha_grad"] * ((1.0 - beta1_max) / (1.0 - beta1))
 
         adaptive_eps = scale_eps(group, p)
 

@@ -45,7 +45,8 @@ def scale_update(
     # Scales update to maintain consistent spectral norm across different layer sizes and ranks.
     if p.ndim >= 2:
         if getattr(p, '_is_lora_A', False):
-            depth = 1
+            rank = p.shape[0]
+            return l2_normalization(update, dim=1, lr=lr / math.sqrt(rank))
         return spectral_normalization(update, vector_state, lr/depth)
 
     return update.mul_(lr)

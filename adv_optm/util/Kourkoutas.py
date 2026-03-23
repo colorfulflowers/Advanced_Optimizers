@@ -21,6 +21,7 @@ class KourkoutasHelper:
 
         # Store stats for external logging (e.g., TensorBoard)
         self.last_beta2_stats = {}
+        self.last_beta_stats  = {}
 
         # This ensures the map is complete before the first backward pass,
         # making it compatible with fused back pass mechanisms.
@@ -63,7 +64,7 @@ class KourkoutasHelper:
             if getattr(p, '_is_oft', False) or getattr(p, '_is_lora_A', False):
                 shape = (p.shape[0],) + (1,) * (p.ndim - 1)
             elif getattr(p, '_is_lora_B', False):
-                shape = (1, p.shape[1]) + (1,) * (p.ndim - 2)
+                shape = ()
             elif p.ndim >= 2:
                 if _row_oriented(p):
                     shape = (p.shape[0],) + (1,) * (p.ndim - 1)   # (out, 1, 1, …)
@@ -103,7 +104,7 @@ class KourkoutasHelper:
             if getattr(p, '_is_oft', False) or getattr(p, '_is_lora_A', False):
                 shape = (p.shape[0],) + (1,) * (p.ndim - 1)   # (out, 1, 1, …)
             elif getattr(p, '_is_lora_B', False):
-                shape = (1, p.shape[1]) + (1,) * (p.ndim - 2)  # (1, in, 1, …)
+                shape = ()
             elif p.ndim >= 2:
                 if _row_oriented(p):
                     shape = (p.shape[0],) + (1,) * (p.ndim - 1)   # (out, 1, 1, …)
@@ -132,10 +133,12 @@ class KourkoutasHelper:
 
     def prepare_step(self, current_step: int, device):
         """
-        Calculates dynamic beta2 for all layers using the completed accumulators
-        from the PREVIOUS step. Should be called once at the start of an optimizer step.
+        Calculates dynamic beta2 (and optionally dynamic beta1) for all layers
+        using the completed accumulators from the PREVIOUS step.
+        Should be called once at the start of an optimizer step.
         """
         beta2_log = []
+        beta1_log = []
         master_defaults = self.optimizer.defaults
 
         for layer_key, info in self.layer_info.items():
@@ -175,11 +178,13 @@ class KourkoutasHelper:
             # Calculate Beta2
             raw = pooled_grad_norm / (r_ema_tensor + tiny_spike)
             sun = raw / (1.0 + raw)
-            beta2_target = beta2_max - (beta2_max - beta2_min) * sun
+
             if k_warmup_steps > 0:
                 weight = min(1.0, current_step / k_warmup_steps)
             else:
                 weight = 1.0
+
+            beta2_target = beta2_max - (beta2_max - beta2_min) * sun
             beta2 = (1.0 - weight) * beta2_max + weight * beta2_target
 
             # Store the final calculated beta2 in the helper's transient state for this step.
@@ -188,18 +193,47 @@ class KourkoutasHelper:
             else:
                 self.layer_state[layer_key]['dynamic_beta2'] = beta2
 
+            beta2_log.append(self.layer_state[layer_key]['dynamic_beta2'])
+
+            # ── Calculate Beta1 (optional) ───────────────────────────────────
+            # Identical formula to beta2, but the ceiling is betas[0] (static beta1).
+            # Enabled via ``kourkoutas_beta1=True`` / ``adam_kourkoutas_beta1=True``
+            # in the param-group or optimizer defaults.
+            use_kb1 = True
+            if use_kb1:
+                beta1_max = betas_tuple[0]
+                # beta1_min falls back to beta2_min when not explicitly provided
+                beta1_min = 0.8
+
+                beta1_target = beta1_max - (beta1_max - beta1_min) * sun
+                beta1 = (1.0 - weight) * beta1_max + weight * beta1_target
+
+                if isinstance(beta1, torch.Tensor) and beta1.numel() == 1 and not group.get('compiled_optimizer', False):
+                    self.layer_state[layer_key]['dynamic_beta1'] = beta1.item()
+                else:
+                    self.layer_state[layer_key]['dynamic_beta1'] = beta1
+
+                beta1_log.append(self.layer_state[layer_key]['dynamic_beta1'])
+            else:
+                # Clear any stale value so get_beta1() falls back to the static beta1.
+                self.layer_state[layer_key].pop('dynamic_beta1', None)
+
             # Reset the accumulator for the next optimizer step.
             accumulator.zero_()
 
-            beta2_log.append(self.layer_state[layer_key]['dynamic_beta2'])
-
         # Compute stats for TensorBoard
+        beta_stats = {}
         if beta2_log:
             # Handles lists containing both standard floats and heterogeneous tensors
-            means = [b.mean().item() if isinstance(b, torch.Tensor) else float(b) for b in beta2_log]
-            self.last_beta2_stats = {
-                'mean': sum(means) / len(means)
-            }
+            means2 = [b.mean().item() if isinstance(b, torch.Tensor) else float(b) for b in beta2_log]
+            beta_stats['beta2_mean'] = sum(means2) / len(means2)
+        if beta1_log:
+            means1 = [b.mean().item() if isinstance(b, torch.Tensor) else float(b) for b in beta1_log]
+            beta_stats['beta1_mean'] = sum(means1) / len(means1)
+
+        # Keep the old attribute name for backward compatibility, plus expose the richer dict.
+        self.last_beta2_stats = {'mean': beta_stats.get('beta2_mean', 0.0)}
+        self.last_beta_stats  = beta_stats
 
     def maybe_prepare_step(self, current_step: int, device):
         """
@@ -241,11 +275,7 @@ class KourkoutasHelper:
                     keepdim=True
                 ).float()
             elif getattr(p, '_is_lora_B', False):
-                    sq_norm = torch.sum(
-                        grad.detach().pow(2),
-                        dim=[0] + list(range(2, grad.ndim)),
-                        keepdim=True
-                    ).float()
+                    sq_norm = torch.sum(grad.detach().pow(2)).float()
             elif grad.ndim >= 2:
                 if _row_oriented(p):
                     sq_norm = torch.sum(
@@ -272,6 +302,23 @@ class KourkoutasHelper:
         # The default is the max value, which is correct for unmapped params or edge cases
         beta2_default = group.get('betas', group.get('adam_betas'))[1] if group.get('betas', group.get('adam_betas')) else 0.999
         return self.layer_state.get(layer_key, {}).get('dynamic_beta2', beta2_default)
+
+    def get_beta1(self, p: torch.Tensor, group: dict) -> float | torch.Tensor:
+        """
+        Gets the dynamic beta1 for the current parameter.
+
+        When ``kourkoutas_beta1`` is enabled for the param-group this returns a
+        value computed by the same Kourkoutas formula as beta2, but bounded by
+        [beta1_min, betas[0]] instead of [beta2_min, betas[1]].
+
+        If the feature is disabled (or the layer was not mapped), falls back to
+        the static ``betas[0]`` value from the group, mirroring the behaviour of
+        ``get_beta2``.
+        """
+        layer_key = self.optimizer.layer_key_fn(p)
+        betas = group.get('betas', group.get('adam_betas'))
+        beta1_default = betas[0] if betas else 0.9
+        return self.layer_state.get(layer_key, {}).get('dynamic_beta1', beta1_default)
 
 def _row_oriented(p: torch.Tensor) -> bool:
     """
@@ -302,7 +349,7 @@ def scale_tiny_spike(group: dict, layer_params: list, tiny_spike: float) -> floa
     if getattr(p0, '_is_lora_A', False) or getattr(p0, '_is_oft', False):
         ema_numel = p0.numel() // p0.shape[0] # (1, in_features)
     elif getattr(p0, '_is_lora_B', False):
-        ema_numel = p0.numel() // p0.shape[1] # (out_features, 1)
+        ema_numel = p0.numel()  # full matrix
     elif p0.ndim >= 2:
         if _row_oriented(p0):
             ema_numel = p0.numel() // p0.shape[0] # elements per row

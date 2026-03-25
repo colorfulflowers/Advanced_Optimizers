@@ -387,20 +387,18 @@ def newton_schulz(
             pair = getattr(p, '_lora_pair', None)
             if pair is not None:
                 # Same explicit zero-initialization gating applied natively in scaled_optm.py for stabilization
-                sigma_pair = pair.detach().norm()
-                if sigma_pair > 1e-4:
-                    lora_ns_fn = _compiled_lora_newton_schulz_iteration if compiled else _lora_newton_schulz_iteration
-                    return lora_ns_fn(
-                        G,
-                        pair=pair.detach(),
-                        is_lora_A=is_lora_A,
-                        steps=steps,
-                        eps=eps,
-                        coeffs=coeffs,
-                        cns=cns,
-                        cns_a_bound=cns_a_bound,
-                        spectral_normalization=spectral_normalization
-                    )
+                lora_ns_fn = _compiled_lora_newton_schulz_iteration if compiled else _lora_newton_schulz_iteration
+                return lora_ns_fn(
+                    G,
+                    pair=pair.detach(),
+                    is_lora_A=is_lora_A,
+                    steps=steps,
+                    eps=eps,
+                    coeffs=coeffs,
+                    cns=cns,
+                    cns_a_bound=cns_a_bound,
+                    spectral_normalization=spectral_normalization
+                )
 
     if compiled:
         ns_fn = _compiled_newton_schulz_iteration

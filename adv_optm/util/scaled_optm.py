@@ -50,17 +50,15 @@ def scale_update(
             if B is not None:
                 # Symmetric treatment: normalize σ(B @ δA) to full-training target.
                 # Guard: B is zero-initialised; skip until it has meaningful scale.
-                sigma_B = B.detach().norm()
-                if sigma_B > 1e-4:
-                    return spectral_normalization_lora_A(update, B.detach(),
-                                                        vector_state, lr / depth)
+                return spectral_normalization_lora_A(update, B.detach(),
+                                                        vector_state, lr / depth, depth)
             return l2_normalization(update, dim=1, lr=lr / math.sqrt(rank))
 
         if getattr(p, '_is_lora_B', False):
             A = getattr(p, '_lora_pair', None)
             if A is not None:
                 return spectral_normalization_lora_B(update, A.detach(),
-                                                    vector_state, lr / depth)
+                                                    vector_state, lr / depth, depth)
             return spectral_normalization(update, vector_state, lr / depth)
 
         return spectral_normalization(update, vector_state, lr / depth)
@@ -217,6 +215,7 @@ def spectral_normalization_lora_B(
     A: torch.Tensor,
     vector_state: torch.Tensor,
     lr: float,
+    depth: int = 1,
 ) -> torch.Tensor:
     """
     Spectral normalization for lora_B using the *combined* weight-space step.
@@ -254,15 +253,18 @@ def spectral_normalization_lora_B(
     u     = torch.mv(B_flat, Av)
     sigma = torch.linalg.vector_norm(u)
 
-    scale = lr * (target_scale / sigma.clamp_min_(1e-12))
-    return update_B.mul_(scale)
+    # Calculate scale-invariant eps: (1/L) * (1/sqrt(d_in * d_out))
+    adaptive_eps = (1.0 / depth) * ((1.0 / math.sqrt(d_out)) + (1.0 / math.sqrt(d_in)))
 
+    scale = lr * (target_scale / sigma.add_(adaptive_eps))
+    return update_B.mul_(scale)
 @torch.no_grad()
 def spectral_normalization_lora_A(
     update_A: torch.Tensor,
     B: torch.Tensor,
     vector_state: torch.Tensor,
     lr: float,
+    depth: int = 1,
 ) -> torch.Tensor:
     d_out = B.shape[0]
     rank  = B.numel() // d_out
@@ -288,5 +290,9 @@ def spectral_normalization_lora_A(
     u     = torch.mv(B_flat, Av)
     sigma = torch.linalg.vector_norm(u)
 
-    scale = lr * (target_scale / sigma.clamp_min_(1e-12))
+    # Calculate scale-invariant eps: (1/L) * (1/sqrt(d_in * d_out))
+    adaptive_eps = (1.0 / depth) * ((1.0 / math.sqrt(d_out)) + (1.0 / math.sqrt(d_in)))
+
+    # Rescale update using additive scale-invariant eps instead of clamp
+    scale = lr * (target_scale / sigma.add_(adaptive_eps))
     return update_A.mul_(scale)

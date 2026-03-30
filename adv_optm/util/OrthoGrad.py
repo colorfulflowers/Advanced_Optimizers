@@ -14,8 +14,7 @@ def _orthogonalize_gradient(p: torch.Tensor, grad: torch.Tensor) -> torch.Tensor
         pair = getattr(p, '_lora_pair', None)
         if pair is not None:
             # Explicit zero-initialization gating (same as Muon/scaled_optm stabilization)
-            if pair.detach().norm() > 1e-4:
-                return _orthogonalize_lora_gradient_pair_granular(p, grad, pair.detach(), is_lora_A)
+            return _orthogonalize_lora_gradient_pair_granular(p, grad, pair.detach(), is_lora_A)
 
     # Granular fallback for OFT or unpaired LoRA
     if getattr(p, '_is_oft', False) or is_lora_A:

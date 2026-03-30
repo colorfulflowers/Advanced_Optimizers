@@ -14,28 +14,15 @@ def scale_update(
     """
     Applies adaptive scaling to the parameter update based on the parameter's
     role (DoRA, OFT, or LoRA/Full Finetuning).
-
-    Args:
-        p: The original parameter tensor.
-        update: The computed gradient/update tensor to be scaled.
-        lr: The learning rate.
-        vector_state: The singular vector state used for spectral normalization.
-
-    Returns:
-        The scaled update tensor.
     """
     is_dora_scale = getattr(p, '_is_dora_scale', False)
     is_oft = getattr(p, '_is_oft', False)
 
-    # DoRA Magnitude Scales (1D) or 1D Bias/Norm layers
     if p.ndim < 2 or is_dora_scale:
         return l2_normalization(update, dim=None, lr=lr)
 
-    # Orthogonal Fine-Tuning (OFT)
-    # This guarantees O(1) update complexity scaling, independent of block sizes.
     if is_oft:
         n = update.shape[1]
-        # Calculate block size (b)
         b = (1 + math.sqrt(1 + 8 * n)) / 2
         target_norm = math.sqrt(b / 8)
         scale = target_norm / math.sqrt(n)
@@ -48,17 +35,25 @@ def scale_update(
             rank = p.shape[0]
             B = getattr(p, '_lora_pair', None)
             if B is not None:
-                # Symmetric treatment: normalize σ(B @ δA) to full-training target.
-                # Guard: B is zero-initialised; skip until it has meaningful scale.
+                # Use balancing factor to prevent matrix factorization scale divergence.
+                norm_A = p.detach().norm().clamp_min(1e-8)
+                norm_B = B.detach().norm().clamp_min(1e-8)
+                # Throttles A if B is smaller. Never artificially blows up A.
+                balance = min(1.0, norm_B / norm_A)
                 return spectral_normalization_lora_A(update, B.detach(),
-                                                        vector_state, lr / depth, depth)
+                                                        vector_state, lr / depth, depth, balance)
             return l2_normalization(update, dim=1, lr=lr / math.sqrt(rank))
 
         if getattr(p, '_is_lora_B', False):
             A = getattr(p, '_lora_pair', None)
             if A is not None:
+                # Use balancing factor to prevent matrix factorization scale divergence.
+                norm_B = p.detach().norm().clamp_min(1e-8)
+                norm_A = A.detach().norm().clamp_min(1e-8)
+                # Throttles B if A is smaller. Never artificially blows up B.
+                balance = min(1.0, norm_A / norm_B)
                 return spectral_normalization_lora_B(update, A.detach(),
-                                                    vector_state, lr / depth, depth)
+                                                    vector_state, lr / depth, depth, balance)
             return spectral_normalization(update, vector_state, lr / depth)
 
         return spectral_normalization(update, vector_state, lr / depth)
@@ -216,6 +211,7 @@ def spectral_normalization_lora_B(
     vector_state: torch.Tensor,
     lr: float,
     depth: int = 1,
+    balance: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Spectral normalization for lora_B using the *combined* weight-space step.
@@ -228,36 +224,34 @@ def spectral_normalization_lora_B(
     """
     d_out = update_B.shape[0]
     rank  = update_B.numel() // d_out
-    d_in  = vector_state.shape[0]          # set correctly by init_spectral_norm
+    d_in  = vector_state.shape[0]
 
     dtype = vector_state.dtype
     B_flat = update_B.view(d_out, rank).to(dtype)
     A_flat = A.view(rank, d_in).to(dtype)
 
-    # Target matches full training: √(d_out / d_in_orig)
-    target_scale = math.sqrt(d_out / d_in)
+    # Target matches full training, dynamically balanced to prevent scale divergence
+    target_scale = math.sqrt(d_out / d_in) * balance
 
     # Power iteration step
-    Av     = torch.mv(A_flat, vector_state)          # [rank]
-    u      = torch.mv(B_flat, Av)                    # [d_out]
-    BTu    = torch.mv(B_flat.mT, u)                  # [rank]
-    v_new  = torch.mv(A_flat.mT, BTu)                # [d_in]
+    Av     = torch.mv(A_flat, vector_state)          
+    u      = torch.mv(B_flat, Av)                    
+    BTu    = torch.mv(B_flat.mT, u)                  
+    v_new  = torch.mv(A_flat.mT, BTu)                
 
     v_norm = torch.linalg.vector_norm(v_new)
     candidate_v = v_new / v_norm
     next_state  = torch.where(v_norm >= 0.5, candidate_v, vector_state)
     vector_state.copy_(next_state)
 
-    # σ estimate with updated v
     Av    = torch.mv(A_flat, vector_state)
     u     = torch.mv(B_flat, Av)
     sigma = torch.linalg.vector_norm(u)
 
-    # Calculate scale-invariant eps: (1/L) * (1/sqrt(d_in * d_out))
     adaptive_eps = (1.0 / depth) * ((1.0 / math.sqrt(d_out)) + (1.0 / math.sqrt(d_in)))
-
     scale = lr * (target_scale / sigma.add_(adaptive_eps))
     return update_B.mul_(scale)
+
 @torch.no_grad()
 def spectral_normalization_lora_A(
     update_A: torch.Tensor,
@@ -265,6 +259,7 @@ def spectral_normalization_lora_A(
     vector_state: torch.Tensor,
     lr: float,
     depth: int = 1,
+    balance: torch.Tensor | None = None,
 ) -> torch.Tensor:
     d_out = B.shape[0]
     rank  = B.numel() // d_out
@@ -274,7 +269,8 @@ def spectral_normalization_lora_A(
     A_flat = update_A.view(rank, d_in).to(dtype)
     B_flat = B.view(d_out, rank).to(dtype)
 
-    target_scale = math.sqrt(d_out / d_in)
+    # Dynamically balanced to prevent scale divergence
+    target_scale = math.sqrt(d_out / d_in) * balance
 
     Av     = torch.mv(A_flat, vector_state)          # [rank]
     u      = torch.mv(B_flat, Av)                    # [d_out]

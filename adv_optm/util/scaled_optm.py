@@ -25,11 +25,18 @@ def scale_update(
         The scaled update tensor.
     """
     is_dora_scale = getattr(p, '_is_dora_scale', False)
+    is_oft = getattr(p, '_is_oft', False)
 
     # DoRA Magnitude Scales (1D) or 1D Bias/Norm layers
     if p.ndim < 2 or is_dora_scale:
         return l2_normalization(update, dim=None, lr=lr)
 
+    # OFT Block Parameters: shape (k, C(b,2))
+    # Normalise by max per-block row norm so that
+    #   ‖ΔR_block‖_spec = max_i ‖ΔRᵢ‖_spec ≤ 2 · max_i ‖Δθᵢ‖₂ ≤ target_scale · lr
+    # for ALL update distributions, not just delocalized ones.
+    if is_oft:
+        return max_row_norm_normalization(update, lr)
 
     # LoRA Factors or Full Finetuning weights
     # Scales update to maintain consistent spectral norm across different layer sizes and ranks.
@@ -87,25 +94,11 @@ def scale_wds(wd: float, cwd: float, p: torch.Tensor) -> tuple[float, float]:
     return wd, cwd
 
 
-@torch.no_grad()
-def l2_normalization(update: torch.Tensor, dim: int | None, lr: float) -> torch.Tensor:
-    """Performs L2 normalization on the update tensor."""
-    norm = torch.linalg.vector_norm(update, ord=2, dim=dim, keepdim=True).add_(1e-12)
-    return update.mul_(lr / norm)
-
-
-@torch.no_grad()
-def rms_normalization(update: torch.Tensor, dim: int | None, lr: float) -> torch.Tensor:
-    """Performs Root Mean Square normalization on the update tensor."""
-    n = update.numel() if dim is None else update.shape[dim]
-    norm = torch.linalg.vector_norm(update, ord=2, dim=dim, keepdim=True).add_(1e-12)
-    scale_n = math.sqrt(n)
-    return update.mul_(lr * scale_n / norm)
-
-
 def is_spectral(p: torch.Tensor) -> bool:
     """Determines if a parameter should undergo spectral normalization updates."""
     if p.ndim < 2:
+        return False
+    if getattr(p, '_is_oft', False):
         return False
     return getattr(p, 'is_hidden', True)
 
@@ -125,11 +118,72 @@ def init_spectral_norm(state: dict, p: torch.Tensor):
     u = torch.randn(d_out, device=p.device, dtype=p.dtype, generator=gen)
     state['spectral_u'] = u.div_(u.norm().add_(1e-12))
 
+
+@torch.no_grad()
+def l2_normalization(update: torch.Tensor, dim: int | None, lr: float) -> torch.Tensor:
+    """Performs L2 normalization on the update tensor."""
+    n = update.numel() if dim is None else update.shape[dim]
+    norm_eps = 1 / math.sqrt(n)
+    norm = torch.linalg.vector_norm(update, ord=2, dim=dim, keepdim=True).clamp_min(norm_eps)
+    return update.mul_(lr / norm)
+
+
+@torch.no_grad()
+def rms_normalization(update: torch.Tensor, dim: int | None, lr: float) -> torch.Tensor:
+    """Performs Root Mean Square normalization on the update tensor."""
+    n = update.numel() if dim is None else update.shape[dim]
+    norm_eps = 1 / math.sqrt(n)
+    norm = torch.linalg.vector_norm(update, ord=2, dim=dim, keepdim=True).clamp_min(norm_eps)
+    scale_n = math.sqrt(n)
+    return update.mul_(lr * scale_n / norm)
+
+
+@torch.no_grad()
+def max_row_norm_normalization(
+    update: torch.Tensor,
+    lr: float,
+    target_scale: float = 0.5,
+) -> torch.Tensor:
+    """
+    Normalizes OFT parameter updates by the maximum per-block (row) L2 norm.
+
+    For OFT params of shape (k, C(b,2)), each row Δθᵢ maps to a skew-symmetric
+    matrix ΔQᵢ with ‖ΔQᵢ‖_spec ≤ ‖Δθᵢ‖₂. Via the Cayley linearization
+    ΔRᵢ ≈ 2ΔQᵢ, bounding max_i ‖Δθᵢ‖₂ directly controls:
+
+        ‖ΔR_block‖_spec = max_i ‖ΔRᵢ‖_spec ≤ 2 · max_i ‖Δθᵢ‖₂
+
+    Unlike spectral normalization of the full (k × C(b,2)) parameter matrix,
+    this guarantee is exact for all update distributions — including worst-case
+    concentrated updates where all energy sits in a single block.
+
+    Result: Var[Δyⱼ] ≤ (target_scale · lr)² = O(1) for every block configuration.
+
+    Args:
+        update: OFT parameter update, shape (k, C(b,2)).
+        lr: Learning rate.
+        target_scale: Desired bound on max_i ‖Δθᵢ‖₂ / lr. Default 0.5 keeps
+                      the effective rotation step ‖ΔR_block‖_spec ≤ lr.
+
+    Returns:
+        Scaled update tensor (in-place).
+    """
+    # Row norms: shape (k,) — one per block
+    row_norms = torch.linalg.vector_norm(update, ord=2, dim=1)
+    max_norm = row_norms.max()
+
+    # Stability floor: equivalent to a single-element vector norm lower bound
+    norm_eps = 1.0 / math.sqrt(update.shape[1])
+    max_norm = max_norm.clamp_min(norm_eps)
+
+    return update.mul_(lr * target_scale / max_norm)
+
+
 @torch.no_grad()
 def spectral_normalization(
-    update: torch.Tensor, 
-    u_state: torch.Tensor, 
-    v_state: torch.Tensor, 
+    update: torch.Tensor,
+    u_state: torch.Tensor,
+    v_state: torch.Tensor,
     lr: float,
     depth: int = 1,
 ) -> torch.Tensor:
@@ -151,19 +205,21 @@ def spectral_normalization(
     v_norm = torch.linalg.vector_norm(v_raw)
     candidate_v = v_raw / v_norm.clamp_min(1e-8)
     # Stability: Only update the state if the norm is significant
-    next_v = torch.where(v_norm >= 0.5, candidate_v, v_state)
+    next_v = torch.where(v_norm >= 1e-6, candidate_v, v_state)
     v_state.copy_(next_v)
 
     # Update u (Left Singular Vector)
     u_raw = torch.mv(update_flat, v_state)
     u_norm = torch.linalg.vector_norm(u_raw)
     candidate_u = u_raw / u_norm.clamp_min(1e-8)
-    next_u = torch.where(u_norm >= 0.5, candidate_u, u_state)
+    next_u = torch.where(u_norm >= 1e-6, candidate_u, u_state)
     u_state.copy_(next_u)
 
     # Estimate sigma (The spectral norm)
     sigma = torch.linalg.vecdot(u_state, u_raw)
 
+    spectral_eps = 1.0 / (math.sqrt(d_out) + math.sqrt(d_in))
+
     # Rescale update
-    scale = lr * (target_scale / sigma.add_(1e-12))
+    scale = lr * (target_scale / sigma.add_(spectral_eps))
     return update.mul_(scale)

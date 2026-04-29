@@ -255,7 +255,7 @@ class SinkSGD_adv(torch.optim.Optimizer):
                 set_state(state, 'momentum_buffer', buf, actual_precision, random_int_state_tensor)
 
                 if nesterov:
-                    update = grad.add(buf, alpha=momentum)
+                    update = grad.lerp(buf, 0.2)
                 else:
                     update = buf.clone()
             else:
@@ -272,7 +272,7 @@ class SinkSGD_adv(torch.optim.Optimizer):
         else:
             update.mul_(update_scaling)
 
-        param_update.apply_parameter_update(self, p, group, update, step_size, random_int_tensor=random_int_tensor)
+        param_update.apply_parameter_update(self, p, group, update, step_size, random_int_tensor=random_int_tensor, decoupled=True)
 
     def compile(self, *args, **kwargs):
         self._compiled_step_parameter = torch.compile(self._step_parameter, *args, **kwargs)

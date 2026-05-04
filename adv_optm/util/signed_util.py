@@ -7,7 +7,19 @@ def apply_stochastic_sign_(update: torch.Tensor, noise: torch.Tensor | None) -> 
     Applies the Stochastic Sign operator S_R(v).
     Uses uniform noise injection to compute the stochastic sign
     """
-    R = update.abs().max().clamp_min(1e-12)
+    if update.dim() >= 2:
+        update_abs = update.abs()
+        # Calculate row and col maximums
+        R_col = update_abs.amax(dim=0, keepdim=True) # Shape: (1, cols)
+        R_row = update_abs.amax(dim=1, keepdim=True) # Shape: (rows, 1)
+        # We use maximum to ensure R is always >= update_abs for the noise bounds
+        R = torch.maximum(R_row, R_col)
+    else:
+        # Fallback for 1D tensors (e.g., biases, layernorm)
+        R = update.abs().max()
+
+    # Prevent division by zero
+    R = R.clamp_min(1e-12)
 
     if noise is None:
         noise = param_update._get_random_noise_for_sso(update)

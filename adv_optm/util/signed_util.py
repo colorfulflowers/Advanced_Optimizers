@@ -1,5 +1,6 @@
 import torch
 
+from . import param_update
 
 def apply_stochastic_sign(update: torch.Tensor, noise: torch.Tensor | None) -> torch.Tensor:
     """
@@ -9,5 +10,5 @@ def apply_stochastic_sign(update: torch.Tensor, noise: torch.Tensor | None) -> t
     R = update.abs().max().clamp_min(1e-12)
 
     if noise is None:
-        noise = torch.rand_like(update) * 2.0 - 1.0
+        noise = param_update._get_random_noise_for_sso(update)
     return torch.sign(update / R + noise, out=update)

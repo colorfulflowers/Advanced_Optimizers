@@ -10,6 +10,8 @@ from ..util.scaled_optm import scale_update, is_spectral, init_spectral_norm
 from ..util.centered_decay import _init_anchor
 from ..util.state_util import init_state_tensor, get_state, set_state, upcast_grad_for_precision
 from ..util.sinkhorn import apply_sr_sinkhorn
+from ..util.oft_util import apply_riemannian_preconditioning, get_geodesic_decay_scaler
+from ..util.signed_util import apply_stochastic_sign
 
 class SinkSGD_adv(torch.optim.Optimizer):
     """
@@ -195,12 +197,15 @@ class SinkSGD_adv(torch.optim.Optimizer):
 
         random_int_tensor = None
         random_int_state_tensor = None
+        sign_noise = None
 
         if group.get('compiled_optimizer', False):
             step_size = torch.as_tensor(step_size)
             if p.dtype == torch.bfloat16 and self.stochastic_rounding:
                 random_int_tensor = param_update._get_random_int_for_sr(p)
                 random_int_state_tensor = random_int_tensor
+            if p.ndim < 2 or getattr(p, '_is_oft', False):
+                sign_noise = param_update._get_random_noise_for_sso(p)
             if group['actual_state_precision'] == 'bf16_sr' and random_int_state_tensor is None:
                 random_int_state_tensor = param_update._get_random_int_for_sr(p)
             elif group['actual_state_precision'] == 'int8_sr':
@@ -211,11 +216,11 @@ class SinkSGD_adv(torch.optim.Optimizer):
         else:
             step_param_fn = self._step_parameter
 
-        step_param_fn(p, grad, state, group, step_size, random_int_tensor, random_int_state_tensor)
+        step_param_fn(p, grad, state, group, step_size, random_int_tensor, random_int_state_tensor, sign_noise)
 
         state['step'] += 1
 
-    def _step_parameter(self, p, grad, state, group, step_size, random_int_tensor, random_int_state_tensor):
+    def _step_parameter(self, p, grad, state, group, step_size, random_int_tensor, random_int_state_tensor, sign_noise):
         grad = upcast_grad_for_precision(grad, state, group['state_precision'])
 
         if group["orthogonal_gradient"]:
@@ -263,8 +268,13 @@ class SinkSGD_adv(torch.optim.Optimizer):
 
             del random_int_state_tensor
 
-        # Sinkhorn iterative normalization
-        update = apply_sr_sinkhorn(update, p, ortho_project=group['orthogonal_sinkhorn'], iters=group['sinkhorn_iterations'])
+        if p.ndim < 2 or getattr(p, '_is_oft', False):
+            update = apply_stochastic_sign(update, sign_noise)
+        else:
+            # Sinkhorn iterative normalization
+            update = apply_sr_sinkhorn(update, p, ortho_project=group['orthogonal_sinkhorn'], iters=group['sinkhorn_iterations'])
+            update = apply_riemannian_preconditioning(p, update)
+        wd_scaler = None #get_geodesic_decay_scaler(p)
 
         update_scaling = step_size
         if group.get('spectral_normalization', False):
@@ -272,7 +282,7 @@ class SinkSGD_adv(torch.optim.Optimizer):
         else:
             update.mul_(update_scaling)
 
-        param_update.apply_parameter_update(self, p, group, update, step_size, random_int_tensor=random_int_tensor, decoupled=True)
+        param_update.apply_parameter_update(self, p, group, update, step_size, random_int_tensor=random_int_tensor, wd_scaler=wd_scaler)
 
     def compile(self, *args, **kwargs):
         self._compiled_step_parameter = torch.compile(self._step_parameter, *args, **kwargs)

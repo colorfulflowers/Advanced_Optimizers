@@ -12,20 +12,9 @@ def apply_sr_sinkhorn(update: torch.Tensor, p: torch.Tensor, ortho_project: bool
     """
     original_shape = update.shape
     original_dtype = update.dtype
-    update = update.float()
-
-    # 1D Vector Case
-    if update.dim() == 1:
-        if ortho_project:
-            p_float = p.float()
-            p_norm_sq = torch.dot(p_float, p_float).add_(1e-30)
-            proj = torch.dot(p_float, update) / p_norm_sq
-            update.sub_(p_float * proj) 
-        norm = update.norm(p=2).clamp_min_(1e-12)
-        return update.mul_(math.sqrt(update.numel()) / norm).view(original_shape).to(original_dtype)
 
     # 2D+ Matrix Case
-    update_2d = update.view(update.shape[0], -1)
+    update_2d = update.view(update.shape[0], -1).float()
 
     m, n = update_2d.shape
 

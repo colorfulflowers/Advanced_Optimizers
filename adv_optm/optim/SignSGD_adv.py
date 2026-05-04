@@ -49,10 +49,6 @@ class SignSGD_adv(torch.optim.Optimizer):
             current gradient. For small batch sizes, use high values (e.g., 10-100) to be
             more responsive. For large batch sizes, use low values (e.g., 0-1) for
             stability. (default: 100.0)
-        freeze_on_flip (bool): Projected SignGD One-hit freeze. Masks updates for
-            coordinates where the gradient sign flips compared to the previous step. (default: False)
-        l1_adaptive (bool): Scales the update step magnitude dynamically
-            by the mean L1 norm of the momentum/gradient to handle gradient heterogeneity.(default: False)
         centered_wd (float): Centered Weight Decay coefficient. Instead of decaying weights
             toward zero, they are decayed toward their initial values (anchors). This
             can be used together with standard weight decay. (default: 0.0)
@@ -89,9 +85,6 @@ class SignSGD_adv(torch.optim.Optimizer):
         # Simplified_AdEMAMix
         alpha_grad: float = 1.0,
         Simplified_AdEMAMix: bool = False,
-        # Projected and adaptive sign
-        freeze_on_flip: bool = False,
-        l1_adaptive: bool = False,
         # Centered WD
         centered_wd: float = 0.0,
         centered_wd_mode: str = 'float8',
@@ -111,9 +104,6 @@ class SignSGD_adv(torch.optim.Optimizer):
             raise ValueError(f"momentum should be in [0.0, 1.0], but got {momentum}")
         if not weight_decay >= 0.0:
             raise ValueError(f"Weight decay must be >= 0.0, but got {weight_decay}")
-        if freeze_on_flip and stochastic_sign:
-            print("Warning: freeze_on_flip is incompatible with stochastic_sign, Disabling freeze_on_flip.")
-            freeze_on_flip = False
 
         state_precision = state_precision.lower()
         valid_precisions = {"auto", "fp32", "factored", "bf16_sr", "fp8_sr", "int8_sr"}
@@ -137,8 +127,6 @@ class SignSGD_adv(torch.optim.Optimizer):
             alpha_grad=alpha_grad,
             Simplified_AdEMAMix=Simplified_AdEMAMix,
             spectral_normalization=spectral_normalization,
-            freeze_on_flip=freeze_on_flip,
-            l1_adaptive=l1_adaptive,
             centered_wd= centered_wd,
             centered_wd_mode= centered_wd_mode,
             state_precision=state_precision,
@@ -211,28 +199,16 @@ class SignSGD_adv(torch.optim.Optimizer):
                     d1, d2 = state['effective_shape']
                     state['mu_m_nmf'] = torch.zeros(d1, device=p.device, dtype=torch.float32)
                     state['mv_m_nmf'] = torch.zeros(d2, device=p.device, dtype=torch.float32)
+                    packed_d2 = (d2 + 7) // 8
+                    state['sign'] = torch.zeros((d1, packed_d2), dtype=torch.uint8, device=p.device)
                 else:
                     init_state_tensor(state, 'exp_avg', p.shape, actual_precision, p.device, dtype)
 
-            # Freeze on flip state init
-            if group.get("freeze_on_flip", True):
-                if state['factored']:
-                    state['effective_shape'] = _get_effective_shape(p.numel()) # Ensure shape exists
-                    d1, d2 = state['effective_shape']
-                    state['sign'] = _pack_bools(grad.view(d1, d2) > 0)
-                else:
-                    state['prev_sign'] = (grad > 0).to(torch.uint8)
-            elif state['factored'] and group["momentum"] > 0:
-                state['effective_shape'] = _get_effective_shape(p.numel())
-                d1, d2 = state['effective_shape']
-                packed_d2 = (d2 + 7) // 8
-                state['sign'] = torch.zeros((d1, packed_d2), dtype=torch.uint8, device=p.device)
 
             if group.get('spectral_normalization', False) and is_spectral(p):
                 init_spectral_norm(state, p)
 
-            if group.get("l1_adaptive", False):
-                state["step"] = 0
+            state["step"] = 0
 
             _init_anchor(p, state, group)
 
@@ -258,7 +234,7 @@ class SignSGD_adv(torch.optim.Optimizer):
 
             if group.get('stochastic_sign', False):
                 random_noise_tensor = param_update._get_random_noise_for_sso(p)
-                
+
             lr = torch.as_tensor(lr)
             step_param_fn = self._compiled_step_parameter
         else:
@@ -266,8 +242,7 @@ class SignSGD_adv(torch.optim.Optimizer):
 
         step_param_fn(p, grad, state, group, lr, random_int_tensor, random_noise_tensor, random_int_state_tensor)
 
-        if group.get("l1_adaptive", False):
-            state["step"] += 1
+        state["step"] += 1
 
     def _step_parameter(self, p, grad, state, group, lr, random_int_tensor, random_noise_tensor, random_int_state_tensor=None):
         grad = upcast_grad_for_precision(grad, state, group['state_precision'])
@@ -291,7 +266,6 @@ class SignSGD_adv(torch.optim.Optimizer):
         momentum = group["momentum"]
         Simplified_AdEMAMix = group["Simplified_AdEMAMix"]
         alpha_grad = group["alpha_grad"]
-        freeze_on_flip = group.get("freeze_on_flip", False) and kappa_p == 1
         if not Simplified_AdEMAMix:
             alpha_grad = 0
         elif momentum == 0:
@@ -301,9 +275,6 @@ class SignSGD_adv(torch.optim.Optimizer):
             # Factored Path
             d1, d2 = state['effective_shape']
             grad_reshaped = grad.view(d1, d2)
-
-            if freeze_on_flip:
-                prev_sign_packed = state['sign'].clone()
 
             if momentum > 0:
                 # Reconstruct momentum m_{t-1}
@@ -319,21 +290,8 @@ class SignSGD_adv(torch.optim.Optimizer):
                 state['mu_m_nmf'], state['mv_m_nmf'], state['sign'] = _factorize_state(exp_avg, signed=True)
             else:
                 raw_update = grad_reshaped.clone()
-                if freeze_on_flip:
-                    state['sign'] = _pack_bools(raw_update > 0)
-
 
             raw_update = raw_update.view(p.shape)
-
-            if freeze_on_flip:
-                # Fast binary diff (XOR) from momentum sign directly
-                flipped_packed = prev_sign_packed ^ state['sign']
-                flipped_mask = _unpack_bools(flipped_packed, original_m=d2).view_as(raw_update)
-                raw_update = torch.where(flipped_mask, 0.0, raw_update)
-                del prev_sign_packed, flipped_packed, flipped_mask
-
-            if not group.get("l1_adaptive", False) or kappa_p != 1:
-                l1_mean = raw_update.abs().mean()
 
             if group.get('stochastic_sign', False):
                 update = apply_stochastic_sign(raw_update, noise=random_noise_tensor)
@@ -356,28 +314,17 @@ class SignSGD_adv(torch.optim.Optimizer):
             else:
                 raw_update = grad.clone()
 
-            if freeze_on_flip:
-                current_sign = (raw_update > 0).to(torch.uint8)
-                raw_update = torch.where(current_sign == state['prev_sign'], raw_update, 0.0)
-                state['prev_sign'] = current_sign
-
-            if not group.get("l1_adaptive", False) or kappa_p != 1:
-                l1_mean = raw_update.abs().mean()
-
             if group.get('stochastic_sign', False):
                 update = apply_stochastic_sign(raw_update, noise=random_noise_tensor)
             else:
                 update = _get_lion_k_update(raw_update, kappa_p)
-
-        if l1_mean is not None:
-            update.mul_(l1_mean)
 
         if group.get('spectral_normalization', False):
             update = scale_update(p, update, lr, state=state)
         else:
             update.mul_(lr)
 
-        param_update.apply_parameter_update(self, p, group, update, lr, random_int_tensor=random_int_tensor, wd_scaler=l1_mean)
+        param_update.apply_parameter_update(self, p, group, update, lr, random_int_tensor=random_int_tensor)
 
     def compile(self, *args, **kwargs):
         self._compiled_step_parameter = torch.compile(self._step_parameter, *args, **kwargs)

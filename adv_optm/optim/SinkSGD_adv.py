@@ -11,7 +11,7 @@ from ..util.centered_decay import _init_anchor
 from ..util.state_util import init_state_tensor, get_state, set_state, upcast_grad_for_precision
 from ..util.sinkhorn import apply_sr_sinkhorn
 from ..util.oft_util import apply_riemannian_preconditioning, get_geodesic_decay_scaler
-from ..util.signed_util import apply_stochastic_sign
+from ..util.signed_util import apply_stochastic_sign_
 
 class SinkSGD_adv(torch.optim.Optimizer):
     """
@@ -269,7 +269,7 @@ class SinkSGD_adv(torch.optim.Optimizer):
             del random_int_state_tensor
 
         if p.ndim < 2 or getattr(p, '_is_oft', False):
-            update = apply_stochastic_sign(update, sign_noise)
+            update = apply_stochastic_sign_(update, sign_noise)
         else:
             # Sinkhorn iterative normalization
             update = apply_sr_sinkhorn(update, p, ortho_project=group['orthogonal_sinkhorn'], iters=group['sinkhorn_iterations'])

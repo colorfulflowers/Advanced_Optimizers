@@ -12,8 +12,7 @@ def apply_stochastic_sign_(update: torch.Tensor, noise: torch.Tensor | None) -> 
         # Calculate row and col maximums
         R_col = update_abs.amax(dim=0, keepdim=True) # Shape: (1, cols)
         R_row = update_abs.amax(dim=1, keepdim=True) # Shape: (rows, 1)
-        # We use maximum to ensure R is always >= update_abs for the noise bounds
-        R = torch.maximum(R_row, R_col)
+        R = torch.minimum(R_row, R_col)
     else:
         # Fallback for 1D tensors (e.g., biases, layernorm)
         R = update.abs().max()

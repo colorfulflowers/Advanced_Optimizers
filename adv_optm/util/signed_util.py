@@ -2,7 +2,7 @@ import torch
 
 from . import param_update
 
-def apply_stochastic_sign(update: torch.Tensor, noise: torch.Tensor | None) -> torch.Tensor:
+def apply_stochastic_sign_(update: torch.Tensor, noise: torch.Tensor | None) -> torch.Tensor:
     """
     Applies the Stochastic Sign operator S_R(v).
     Uses uniform noise injection to compute the stochastic sign
@@ -11,4 +11,6 @@ def apply_stochastic_sign(update: torch.Tensor, noise: torch.Tensor | None) -> t
 
     if noise is None:
         noise = param_update._get_random_noise_for_sso(update)
-    return torch.sign(update / R + noise, out=update)
+
+    # Chain inplace operations: torch.sign(update / R + noise)
+    return update.div_(R).add_(noise).sign_()

@@ -7,50 +7,29 @@ def _block_size_from_n_elements(n_elements: int) -> int:
 
 def get_geodesic_decay_scaler(p: torch.Tensor) -> torch.Tensor:
     """
-    Computes the True Matrix geodesic weight decay direction.
+    Computes the scalar multiplier for geodesic weight decay.
+
+    Near identity (‖Q‖ ≈ 0), this returns 1.0 (standard L2 decay). 
+    Far from identity, it decays towards 0, respecting the bounded 
+    geometry of SO(n) so large rotations aren't infinitely penalized.
+
+    Args:
+        p: Tensor of shape (rank, n_elements) representing the upper triangular elements
+
+    Returns:
+        Tensor of shape (rank, 1) to be multiplied by wd and p.
     """
-    n_el = p.shape[-1]
-    block_size = _block_size_from_n_elements(n_el)
-    device, dtype = p.device, p.dtype
+    block_size = _block_size_from_n_elements(p.shape[-1])
 
-    # 1. Get indices for upper triangular elements
-    rows, cols = torch.triu_indices(block_size, block_size, 1, device=device)
-    
-    # 2. Flatten any prepended batch dimensions for processing
-    orig_shape = p.shape
-    p_flat = p.view(-1, n_el)
-    batch_size = p_flat.shape[0]
-    
-    # 3. Construct skew-symmetric matrix Q
-    Q = torch.zeros(batch_size, block_size, block_size, device=device, dtype=dtype)
-    batch_idx = torch.arange(batch_size, device=device)[:, None]
-    
-    Q = Q.index_put((batch_idx, rows, cols), p_flat)
-    Q = Q - Q.transpose(-2, -1)
-    
-    # 4. Compute True Matrix Dampener: I - (Q^2 / n_el)
-    # Since Q is skew-symmetric, Q^2 is negative semi-definite.
-    # Therefore, (I - Q^2) is positive definite and safely invertible.
-    I = torch.eye(block_size, device=device, dtype=dtype).unsqueeze(0)
-    Q_sq = torch.bmm(Q, Q)
-    
-    # Mirroring your scalar logic: 1 / (1 + ||Q||^2 / n_el)
-    dampener_matrix = I - (Q_sq / n_el)
-    
-    # 5. Apply the dampener to Q: inv(Dampener) @ Q
-    # Using linalg.solve is faster and numerically more stable than explicit inverse
-    # Upcast to float32 for the solve operation
-    # BFloat16 is not supported by MAGMA's batched LU solver.
-    decay_Q = torch.linalg.solve(
-        dampener_matrix.to(torch.float32), 
-        Q.to(torch.float32)
-    ).to(dtype)
+    # Sum of squared elements equals the sum of squared eigenvalues of Q
+    block_norm_sq = (p * p).sum(dim=-1, keepdim=True)   # (r, 1)
 
-    # 6. Extract the preconditioned upper-triangular elements
-    decay_p_flat = decay_Q[batch_idx, rows, cols]
-    
-    # 7. Return reshaped to match original p
-    return decay_p_flat.view(orig_shape)
+    # We estimate the average squared eigenvalue by dividing by the number of pairs (d/2)
+    mean_eigenval_sq = block_norm_sq / (block_size // 2.0)
+
+    decay_scaler = 1.0 / (1.0 + mean_eigenval_sq)
+
+    return decay_scaler
 
 
 def apply_riemannian_preconditioning(p: torch.Tensor, update: torch.Tensor) -> torch.Tensor:

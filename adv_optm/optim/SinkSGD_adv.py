@@ -288,7 +288,7 @@ class SinkSGD_adv(torch.optim.Optimizer):
         if not group.get('normed_momentum', False):
             if not is_vector:
                 # Sinkhorn iterative normalization
-                update = apply_sr_sinkhorn(update, p, ortho_project=orthogonal_sinkhorn, iters=sinkhorn_iterations)
+                update = apply_sr_sinkhorn(update, iters=sinkhorn_iterations, p=p, ortho_project=orthogonal_sinkhorn)
             else:
                 # For vectors, apply adaptive stochastic sign
                 update = apply_stochastic_sign_(update, sign_noise, is_vector=is_vector)

@@ -1,7 +1,7 @@
 import math
 import torch
 
-def apply_sr_sinkhorn(update: torch.Tensor, p: torch.Tensor, ortho_project: bool, iters: int = 5) -> torch.Tensor:
+def apply_sr_sinkhorn(update: torch.Tensor, p: torch.Tensor | None = None, ortho_project: bool, iters: int = 5) -> torch.Tensor:
     """
     Applies Square-Root Sinkhorn (SR-Sinkhorn) multi-normalization.
     As described in 'Gradient Multi-Normalization for Efficient LLM Training'.

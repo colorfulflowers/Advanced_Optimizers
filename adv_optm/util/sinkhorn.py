@@ -75,3 +75,17 @@ def ortho_normed(p_2d, update_2d, p_norm_sq, dim, target_norm):
     g_orth_norm = update_2d.norm(p=2, dim=dim, keepdim=True).clamp_min_(1e-12)
     scale_factor = target_norm / g_orth_norm
     return update_2d.mul_(scale_factor)
+
+def geometric_sinkhorn_wd(p: torch.Tensor, iters: int = 5):
+    """
+    Computes a structural weight decay target to complement Sinkhorn normalization.
+    Minimizes structural imbalance. It pulls the weight matrix toward a state where every neuron (row) and every feature (column) has an equal share of the model's capacity.
+    """
+    target_decay = apply_sr_sinkhorn(p.clone(), iters)
+
+    # Scale target so its L2 norm matches the original weights.
+    # This ensures the "average" weight decay applied is identical to standard WD.
+    p_norm = p.norm(p=2)
+    target_decay.mul_(p_norm /  math.sqrt(p.numel()))
+
+    return target_decay

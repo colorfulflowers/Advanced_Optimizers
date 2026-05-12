@@ -1,5 +1,7 @@
 import torch
 
+import math
+
 from . import param_update
 
 def apply_stochastic_sign_(update: torch.Tensor, noise: torch.Tensor | None, is_vector: bool = False) -> torch.Tensor:
@@ -54,3 +56,19 @@ def apply_stochastic_sign_(update: torch.Tensor, noise: torch.Tensor | None, is_
 
     # Final stochastic step: sign(v + U[-1, 1])
     return update.add_(noise).sign_()
+
+def geometric_sign_wd(p: torch.Tensor, stochastic: bool, noise: torch.Tensor | None = None, is_vector: bool = False):
+    """
+    Computes a Structural Sign target for weight decay.
+    """
+    if stochastic:
+        target_decay = apply_stochastic_sign_(p.clone(), noise, is_vector)
+    else:
+        target_decay = p.sign()
+
+    # Scale target so its L2 norm matches the original weights.
+    # This ensures the "average" weight decay applied is identical to standard WD.
+    p_norm = p.norm(p=2)
+    target_decay.mul_(p_norm /  math.sqrt(p.numel()))
+
+    return target_decay

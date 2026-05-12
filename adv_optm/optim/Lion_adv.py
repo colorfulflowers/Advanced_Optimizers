@@ -8,7 +8,7 @@ from ..util.factorization_util import _get_effective_shape, _reconstruct_state, 
 from ..util.lion_k import _get_lion_k_update
 from ..util.scaled_optm import scale_update, is_spectral, init_spectral_norm
 from ..util.centered_decay import _init_anchor
-from ..util.signed_util import apply_stochastic_sign_
+from ..util.signed_util import apply_stochastic_sign_, geometric_sign_wd
 
 
 class Lion_adv(torch.optim.Optimizer):
@@ -239,6 +239,8 @@ class Lion_adv(torch.optim.Optimizer):
                 kappa_p = 1.0
 
         beta1, beta2 = group["betas"]
+        sso = group.get('stochastic_sign', False)
+        is_vector = grad.ndim < 2 or getattr(p, '_is_dora_scale', False) or getattr(p, 'is_vector', False)
 
         if state['factored']:
             # Factored Path
@@ -267,8 +269,8 @@ class Lion_adv(torch.optim.Optimizer):
 
             update = update.view(p.shape)
 
-            if group.get('stochastic_sign', False):
-                update = apply_stochastic_sign_(update, noise=random_noise_tensor)
+            if sso:
+                update = apply_stochastic_sign_(update, noise=random_noise_tensor, is_vector=is_vector)
             else:
                 update = _get_lion_k_update(update, kappa_p)
 
@@ -288,8 +290,8 @@ class Lion_adv(torch.optim.Optimizer):
                 update.mul_(mask)
                 del mask
 
-            if group.get('stochastic_sign', False):
-                update = apply_stochastic_sign_(update, noise=random_noise_tensor)
+            if sso:
+                update = apply_stochastic_sign_(update, noise=random_noise_tensor, is_vector=is_vector)
             else:
                 update = _get_lion_k_update(update, kappa_p)
 
@@ -298,7 +300,12 @@ class Lion_adv(torch.optim.Optimizer):
         else:
             update.mul_(lr)
 
-        param_update.apply_parameter_update(self, p, group, update, lr, random_int_tensor=random_int_tensor)
+        if group.get('geometric_wd', False):
+            decay_target = geometric_sign_wd(p, stochastic=sso, noise=random_noise_tensor, is_vector=is_vector)
+        else:
+            decay_target = None
+
+        param_update.apply_parameter_update(self, p, group, update, lr, random_int_tensor=random_int_tensor, decay_target=decay_target)
 
     def compile(self, *args, **kwargs):
         self._compiled_step_parameter = torch.compile(self._step_parameter, *args, **kwargs)

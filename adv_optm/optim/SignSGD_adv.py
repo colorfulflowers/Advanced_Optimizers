@@ -8,7 +8,7 @@ from ..util.factorization_util import _get_effective_shape, _reconstruct_state, 
 from ..util.lion_k import _get_lion_k_update
 from ..util.scaled_optm import scale_update, is_spectral, init_spectral_norm
 from ..util.centered_decay import _init_anchor
-from ..util.signed_util import apply_stochastic_sign_
+from ..util.signed_util import apply_stochastic_sign_, geometric_sign_wd
 from ..util.state_util import init_state_tensor, get_state, set_state, upcast_grad_for_precision
 
 
@@ -244,9 +244,11 @@ class SignSGD_adv(torch.optim.Optimizer):
         momentum = group["momentum"]
         nesterov = group.get('nesterov', False)
         nesterov_coef = group.get('nesterov_coef', None)
+        normed_momentum = group.get('normed_momentum', False)
+        sso = group.get('stochastic_sign', False)
 
-        if group.get('normed_momentum', False):
-            if group.get('stochastic_sign', False):
+        if normed_momentum:
+            if sso:
                 grad = apply_stochastic_sign_(grad, noise=random_noise_tensor, is_vector=is_vector)
             else:
                 grad = grad.sign_()
@@ -295,8 +297,8 @@ class SignSGD_adv(torch.optim.Optimizer):
             else:
                 raw_update = grad.clone()
 
-        if not group.get('normed_momentum', False):
-            if group.get('stochastic_sign', False):
+        if not normed_momentum:
+            if sso:
                 update = apply_stochastic_sign_(raw_update, noise=random_noise_tensor, is_vector=is_vector)
             else:
                 update = raw_update.sign_()
@@ -308,7 +310,12 @@ class SignSGD_adv(torch.optim.Optimizer):
         else:
             update.mul_(lr)
 
-        param_update.apply_parameter_update(self, p, group, update, lr, random_int_tensor=random_int_tensor)
+        if group.get('geometric_wd', False):
+            decay_target = geometric_sign_wd(p, stochastic=sso, noise=random_noise_tensor, is_vector=is_vector)
+        else:
+            decay_target = None
+
+        param_update.apply_parameter_update(self, p, group, update, lr, random_int_tensor=random_int_tensor, decay_target=decay_target)
 
     def compile(self, *args, **kwargs):
         self._compiled_step_parameter = torch.compile(self._step_parameter, *args, **kwargs)

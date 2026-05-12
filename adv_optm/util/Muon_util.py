@@ -447,3 +447,17 @@ def get_spectral_scaling(p, shape: torch.Size, n_layers: int):
     wd_scale = 1.0 / d_in
 
     return ns_eps, adaptive_eps, spectral_target, wd_scale
+
+def geometric_muon_wd(p: torch.Tensor, iters: int = 5):
+    """
+    Computes a structural weight decay target to complement Sinkhorn normalization.
+    Minimizes structural imbalance. It pulls the weight matrix toward a state where every neuron (row) and every feature (column) has an equal share of the model's capacity.
+    """
+    target_decay = _compiled_newton_schulz_iteration(p.clone(), iters)
+
+    # Scale target so its L2 norm matches the original weights.
+    # This ensures the "average" weight decay applied is identical to standard WD.
+    p_norm = p.norm(p=2)
+    target_decay.mul_(p_norm /  math.sqrt(p.numel()))
+
+    return target_decay

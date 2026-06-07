@@ -589,27 +589,17 @@ class Prodigy_adv(torch.optim.Optimizer):
             d_hat = g_group['d']
             if global_d_denom > 0:
                 d_hat = d_coef * global_d_numerator / global_d_denom
-                d_limiter_warmup_steps = g_group.get('d_limiter_warmup_steps', 0)
-                d_limiter_active = g_group.get('d_limiter', False) or d_limiter_warmup_steps > 0
-                if d_limiter_active:
-                    if d_limiter_warmup_steps > 0:
-                        t = min(g_group['k'], d_limiter_warmup_steps)
-                        r = t / d_limiter_warmup_steps
-                        curve = g_group.get('d_limiter_warmup_curve', 'cosine')
-                        if curve == 'cosine':
-                            multiplier = (1 - math.cos(math.pi * r)) / 2
-                        elif curve == 'squared':
-                            multiplier = r * r
-                        elif curve == 'sqrt':
-                            multiplier = math.sqrt(r)
-                        else:  # linear
-                            multiplier = r
-                        d_hat = min(g_group['d'] * multiplier, d_hat)
-                    else:
-                        d_hat = min(g_group['d'] * (2 ** 0.25), d_hat)
+
+                # 1. d_limiter (fixed cap on d_hat)
+                if g_group.get('d_limiter', False):
+                    d_hat = min(g_group['d'] * (2 ** 0.25), d_hat)
+
+                # 2. update d_max and d (initial step handling)
                 if g_group['d'] == g_group['d0']:
                     g_group['d'] = max(g_group['d'], d_hat)
                 d_max = max(d_max, d_hat)
+
+                # 3. growth_rate
                 growth_rate_steps = g_group.get('growth_rate_steps', 0)
                 effective_growth_rate = (
                     growth_rate
@@ -617,6 +607,23 @@ class Prodigy_adv(torch.optim.Optimizer):
                     else float('inf')
                 )
                 g_group['d'] = min(d_max, g_group['d'] * effective_growth_rate)
+
+                # 4. d_limiter_warmup: applied last, directly on d
+                d_limiter_warmup_steps = g_group.get('d_limiter_warmup_steps', 0)
+                if d_limiter_warmup_steps > 0:
+                    t = min(g_group['k'], d_limiter_warmup_steps)
+                    r = t / d_limiter_warmup_steps
+                    curve = g_group.get('d_limiter_warmup_curve', 'cosine')
+                    if curve == 'cosine':
+                        multiplier = (1 - math.cos(math.pi * r)) / 2
+                    elif curve == 'squared':
+                        multiplier = r * r
+                    elif curve == 'sqrt':
+                        multiplier = math.sqrt(r)
+                    else:  # linear
+                        multiplier = r
+                    d0 = g_group['d0']
+                    g_group['d'] = d0 + (g_group['d'] - d0) * multiplier
 
             for group in self.param_groups:
                 group['d_numerator'] = global_d_numerator

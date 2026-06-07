@@ -79,12 +79,14 @@ class Prodigy_adv(torch.optim.Optimizer):
             fully lifted. Set to 0 to use the fixed d_limiter behaviour.
             (default: 0)
         d_limiter_warmup_curve (str): The curve shape used to interpolate the
-            d_limiter multiplier from 0 to 1 during warmup. Options:
-            ``"cosine"``  - S-curve, slow start and end, fast middle (recommended);
-            ``"squared"`` - slow start, fast end;
-            ``"sqrt"``    - fast start, slow end;
-            ``"linear"``  - uniform increase.
-            (default: "cosine")
+            d_limiter multiplier from 0 to 1 during warmup. When passing via
+            optimizer_args (e.g. kohya-ss), wrap the value in single quotes:
+            ``d_limiter_warmup_curve='cosine'``. Options:
+            ``'cosine'``  - S-curve, slow start and end, fast middle (recommended);
+            ``'squared'`` - slow start, fast end;
+            ``'sqrt'``    - fast start, slow end;
+            ``'linear'``  - uniform increase.
+            (default: 'cosine')
         growth_rate_steps (int): If greater than zero, disable the `growth_rate`
             restriction after the specified number of optimizer steps, allowing
             Prodigy's D-adaptation to update `d` freely. Unlike `prodigy_steps`,

@@ -611,7 +611,7 @@ class Prodigy_adv(torch.optim.Optimizer):
                 # 4. d_limiter_warmup: applied last, directly on d
                 d_limiter_warmup_steps = g_group.get('d_limiter_warmup_steps', 0)
                 if d_limiter_warmup_steps > 0:
-                    t = min(g_group['k'], d_limiter_warmup_steps)
+                    t = min(g_group['k'] + 1, d_limiter_warmup_steps)
                     r = t / d_limiter_warmup_steps
                     curve = g_group.get('d_limiter_warmup_curve', 'cosine')
                     if curve == 'cosine':

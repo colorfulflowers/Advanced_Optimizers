@@ -67,7 +67,7 @@ class Lion_adv(torch.optim.Optimizer):
         # Stochastic Rounding for BF16
         stochastic_rounding: bool = True,
         # OrthoGrad
-        orthogonal_gradient: bool = False,
+        orthogonal_gradient: str = 'disabled', # 'flattened', 'iterative'
         # Lion-k
         kappa_p: float = 1.0,
         auto_kappa_p: bool = False,
@@ -213,8 +213,9 @@ class Lion_adv(torch.optim.Optimizer):
     def _step_parameter(self, p, grad, state, group, lr, random_int_tensor, random_noise_tensor):
         if grad.dtype != torch.float32 and state['factored']:
             grad = grad.float()
-        if group["orthogonal_gradient"]:
-            grad = _orthogonalize_gradient(p, grad)
+        is_vector = p.ndim < 2 or getattr(p, '_is_dora_scale', False) or getattr(p, 'is_vector', False)
+
+        grad = _orthogonalize_gradient(p, grad, group["orthogonal_gradient"])
 
         # Lion-K Logic
         kappa_p = group.get("kappa_p", 1.0)
@@ -250,7 +251,7 @@ class Lion_adv(torch.optim.Optimizer):
             update = update.view(p.shape)
 
             if group.get('stochastic_sign', False):
-                update = apply_stochastic_sign_(update, noise=random_noise_tensor)
+                update = apply_stochastic_sign_(update, noise=random_noise_tensor, is_vector=is_vector)
             else:
                 update = _get_lion_k_update(update, kappa_p)
 
@@ -265,7 +266,7 @@ class Lion_adv(torch.optim.Optimizer):
             exp_avg.lerp_(grad, 1 - beta2)
 
             if group.get('stochastic_sign', False):
-                update = apply_stochastic_sign_(update, noise=random_noise_tensor)
+                update = apply_stochastic_sign_(update, noise=random_noise_tensor, is_vector=is_vector)
             else:
                 update = _get_lion_k_update(update, kappa_p)
 

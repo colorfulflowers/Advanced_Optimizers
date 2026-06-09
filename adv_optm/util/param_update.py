@@ -6,7 +6,7 @@ import torch.nn.functional as F
 
 from typing import Dict, Any
 
-from .scaled_optm import adjust_wds, scale_wds
+from .scaled_optm import adjust_wds
 from .centered_decay import dequantize_anchor
 
 _generators: Dict[torch.device, torch.Generator] = {}
@@ -48,7 +48,7 @@ def _apply_weight_decay(
                 p_calc.add_(wd_target, alpha=-scaled_wd)
 
     # Centered Weight Decay (pulls toward anchor)
-    if scaled_cwd is not None and 'anchor_type' in state:
+    if scaled_cwd is not None and 'anchor_data' in state:
         if cwd_target is not None:
             decay_target = cwd_target
         else:
@@ -330,7 +330,7 @@ def _copy_int8_sym_blockwise_stochastic_core_(
     target: torch.Tensor,
     source: torch.Tensor,
     scales: torch.Tensor,
-    random_int_tensor: torch.Tensor | None,
+    random_int_tensor: torch.Tensor,
     block_size: int = 2048,
     val_blocks: torch.Tensor | None = None,
 ) -> None:

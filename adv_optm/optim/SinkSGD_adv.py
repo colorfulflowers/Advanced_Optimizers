@@ -69,7 +69,7 @@ class SinkSGD_adv(torch.optim.Optimizer):
         # Stochastic Rounding for BF16
         stochastic_rounding: bool = True,
         # OrthoGrad
-        orthogonal_gradient: bool = False,
+        orthogonal_gradient: str = 'disabled', # 'flattened', 'iterative'
         # Spectral Normed Optimizer
         spectral_normalization: bool = False,
         # Centered WD
@@ -89,8 +89,8 @@ class SinkSGD_adv(torch.optim.Optimizer):
             raise ValueError(f"Momentum should be >= 0.0. Got {momentum}")
         if not (weight_decay >= 0.0):
             raise ValueError(f"Weight-decay should be >= 0.0. Got {weight_decay}")
-        if snr_cond and not normed_momentum:
-            raise NotImplementedError(f"snr_cond is intended to be used with normed_momentum")
+        if snr_cond and not normed_momentum and not momentum > 0:
+            raise NotImplementedError(f"snr_cond is intended to be used with normed_momentum.")
 
         state_precision = state_precision.lower()
         valid_precisions = {"auto", "fp32", "factored", "bf16_sr", "fp16", "int8_sr"}
@@ -237,8 +237,7 @@ class SinkSGD_adv(torch.optim.Optimizer):
         wd_target = None
         cwd_target = None
 
-        if group["orthogonal_gradient"]:
-            grad = _orthogonalize_gradient(p, grad)
+        grad = _orthogonalize_gradient(p, grad, group["orthogonal_gradient"])
 
         if normed_mt:
             if not is_vector:
@@ -264,6 +263,10 @@ class SinkSGD_adv(torch.optim.Optimizer):
                     else:
                         denom = (1.0 - buf.square()).clamp_min_(1e-30).sqrt_().view_as(p)
 
+                if nesterov and normed_mt:
+                    # Scale the normalized gradient using empirical buffer magnitude (SNR recovery)
+                    normed_grad = buf.abs().mul_(grad_reshaped)
+
                 buf.lerp_(grad_reshaped, 1 - momentum)
 
                 # Factorize updated buffer
@@ -272,9 +275,7 @@ class SinkSGD_adv(torch.optim.Optimizer):
                 if nesterov:
                     nv_coef = momentum if nesterov_coef is None else nesterov_coef
                     if normed_mt:
-                        # Scale the normalized gradient down to match the buffer's variance
-                        ema_std = math.sqrt((1 - momentum) / (1 + momentum))
-                        update = (grad_reshaped * ema_std).lerp_(buf, nv_coef)
+                        update = normed_grad.lerp_(buf, nv_coef)
                     else:
                         update = grad_reshaped.lerp(buf, nv_coef)
                 else:
@@ -299,6 +300,10 @@ class SinkSGD_adv(torch.optim.Optimizer):
                     else:
                         denom = (1.0 - buf.square()).clamp_min_(1e-30).sqrt_()
 
+                if nesterov and normed_mt:
+                    # Scale the normalized gradient using empirical buffer magnitude (SNR recovery)
+                    normed_grad = buf.abs().mul_(grad)
+
                 buf.lerp_(grad, 1 - momentum)
 
                 set_state(state, 'momentum_buffer', buf, actual_precision, random_int_state_tensor)
@@ -306,9 +311,7 @@ class SinkSGD_adv(torch.optim.Optimizer):
                 if nesterov:
                     nv_coef = momentum if nesterov_coef is None else nesterov_coef
                     if normed_mt:
-                        # Scale the normalized gradient down to match the buffer's variance
-                        ema_std = math.sqrt((1 - momentum) / (1 + momentum))
-                        update = (grad * ema_std).lerp_(buf, nv_coef)
+                        update = normed_grad.lerp_(buf, nv_coef)
                     else:
                         update = grad.lerp(buf, nv_coef)
                 else:
@@ -342,7 +345,7 @@ class SinkSGD_adv(torch.optim.Optimizer):
                     wd_scaler = get_sinkhorn_wd_scaler(p, row_denom=vt_row, col_denom=vt_col)
                 else:
                     wd_target = get_signsgd_wd_target(p, denom=denom)
-            if is_vector and group.get('centered_wd', 0.0) > 0 and 'anchor_type' in state:
+            if is_vector and group.get('centered_wd', 0.0) > 0 and 'anchor_data' in state:
                 anchor = dequantize_anchor(p, state, group, p.dtype)
                 cwd_target = get_signsgd_wd_target(p.sub(anchor), denom=denom)
                 del anchor

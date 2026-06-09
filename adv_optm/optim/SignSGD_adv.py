@@ -62,7 +62,7 @@ class SignSGD_adv(torch.optim.Optimizer):
         # Stochastic Rounding for BF16
         stochastic_rounding: bool = True,
         # OrthoGrad
-        orthogonal_gradient: bool = False,
+        orthogonal_gradient: str = 'disabled', # 'flattened', 'iterative'
         # Stochastic Sign Operator
         stochastic_sign: bool = False,
         # Nesterov momentum
@@ -171,7 +171,7 @@ class SignSGD_adv(torch.optim.Optimizer):
     def __init_state(self, p, group):
         state = self.state[p]
         # State Initialization
-        if group["momentum"] > 0 and len(state) == 0:
+        if 'step' not in state:
             req_precision = group['state_precision']
             is_vector = len(p.shape) == 1 and not group['vector_reshape']
 
@@ -259,8 +259,7 @@ class SignSGD_adv(torch.optim.Optimizer):
         wd_target = None
         cwd_target = None
 
-        if group["orthogonal_gradient"]:
-            grad = _orthogonalize_gradient(p, grad)
+        grad = _orthogonalize_gradient(p, grad, group["orthogonal_gradient"])
 
         if normed_mt:
             if sso:
@@ -280,14 +279,16 @@ class SignSGD_adv(torch.optim.Optimizer):
                 if snr_cond:
                     denom = (1.0 - exp_avg.square()).clamp_min_(1e-30).sqrt_().view_as(p)
 
+                if nesterov and normed_mt:
+                    # Scale the normalized gradient using empirical buffer magnitude (SNR recovery)
+                    normed_grad = exp_avg.abs().mul_(grad_reshaped)
+
                 exp_avg.lerp_(grad_reshaped, 1 - momentum)
 
                 if nesterov:
                     nv_coef = momentum if nesterov_coef is None else nesterov_coef
                     if normed_mt:
-                        # Scale the normalized gradient down to match the buffer's variance
-                        ema_std = math.sqrt((1 - momentum) / (1 + momentum))
-                        raw_update = (grad_reshaped * ema_std).lerp_(exp_avg, nv_coef)
+                        raw_update = normed_grad.lerp_(exp_avg, nv_coef)
                     else:
                         raw_update = grad_reshaped.lerp(exp_avg, nv_coef)
                 else:
@@ -309,14 +310,16 @@ class SignSGD_adv(torch.optim.Optimizer):
                 if snr_cond:
                     denom = (1.0 - exp_avg.square()).clamp_min_(1e-30).sqrt_()
 
+                if nesterov and normed_mt:
+                    # Scale the normalized gradient using empirical buffer magnitude (SNR recovery)
+                    normed_grad = exp_avg.abs().mul_(grad)
+
                 exp_avg.lerp_(grad, 1 - momentum)
 
                 if nesterov:
                     nv_coef = momentum if nesterov_coef is None else nesterov_coef
                     if normed_mt:
-                        # Scale the normalized gradient down to match the buffer's variance
-                        ema_std = math.sqrt((1 - momentum) / (1 + momentum))
-                        raw_update = (grad * ema_std).lerp_(exp_avg, nv_coef)
+                        raw_update = normed_grad.lerp_(exp_avg, nv_coef)
                     else:
                         raw_update = grad.lerp(exp_avg, nv_coef)
                 else:
@@ -340,7 +343,7 @@ class SignSGD_adv(torch.optim.Optimizer):
         if group.get('geometric_wd', False) and group["weight_decay"] > 0 :
             wd_target = get_signsgd_wd_target(p, denom=denom, stochastic_sign=sso, noise=random_noise_tensor, is_vector=is_vector)
 
-            if group.get('centered_wd', 0.0) > 0 and 'anchor_type' in state:
+            if group.get('centered_wd', 0.0) > 0 and 'anchor_data' in state:
                 anchor = dequantize_anchor(p, state, group, p.dtype)
                 cwd_target = get_signsgd_wd_target(p.sub(anchor), denom=denom, stochastic_sign=sso, noise=random_noise_tensor, is_vector=is_vector)
                 del anchor

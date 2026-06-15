@@ -2,7 +2,7 @@ import torch
 
 from ..util import param_update
 from ..util.Muon_util import newton_schulz, _is_suitable_for_muon, rms_adjustment, normuon_update, approx_mars
-from ..util.scaled_optm import spectral_normalization, init_spectral_norm
+from ..util.scaled_optm import scale_update, init_spectral_norm
 from ..util.factorization_util import _get_effective_shape, _factorize_state, _reconstruct_state
 from ..util.OrthoGrad import _orthogonalize_gradient
 from ..util.Kourkoutas import KourkoutasHelper
@@ -186,8 +186,6 @@ class Muon_adv(torch.optim.Optimizer):
         if spectral_normalization and rms_rescaling:
             print("Warning: spectral_normalization is incompatible with rms_rescaling, Disabling rms_rescaling.")
             rms_rescaling = False
-        if spectral_normalization and accelerated_ns:
-            raise ValueError("spectral_normalization violates accelerated Newton-Schulz assumptions. Pick one of them.")
 
         # Legacy backwards compatibility support for `nnmf_factor=True`
         if nnmf_factor:
@@ -415,6 +413,7 @@ class Muon_adv(torch.optim.Optimizer):
             state['step'] += 1
 
         else: # Muon path
+            random_G_sketch = None
             if is_compiled:
                 lr = torch.as_tensor(group['lr'])
                 muon_step_param = self._compiled_muon_step_parameter
@@ -431,7 +430,6 @@ class Muon_adv(torch.optim.Optimizer):
             else:
                 lr = group['lr']
                 random_int_state_tensor = None
-                random_G_sketch = None
                 muon_step_param = self._muon_step_parameter
 
             muon_step_param(p, grad, state, group, lr, random_int_tensor, random_int_state_tensor, random_G_sketch)
@@ -545,7 +543,7 @@ class Muon_adv(torch.optim.Optimizer):
 
             if group.get('spectral_normalization', False):
                 # Spectral Normalization
-                spectral_normalization(update, state['spectral_u'], state['spectral_v'], lr)
+                scale_update(p, update, lr, state)
             else:
                 # RMS-aligned rescaling
                 rms_adjustment(update, group['rms_rescaling'], lr)

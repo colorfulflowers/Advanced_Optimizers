@@ -201,6 +201,11 @@ class AdamW_adv(torch.optim.Optimizer):
         super().load_state_dict(state_dict)
         param_update.post_process_loaded_state(self)
 
+        # Pre-initialize states for all parameters to stabilize len(self.state).
+        # This prevents torch.compile from triggering recompilations due to 
+        # len(self.state) changing dynamically during the first step after loading.
+        self.init_step()
+
     @property
     def supports_fused_back_pass(self):
         return True

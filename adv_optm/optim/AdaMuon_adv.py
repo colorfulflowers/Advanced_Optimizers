@@ -299,6 +299,7 @@ class AdaMuon_adv(torch.optim.Optimizer):
         """
         super().load_state_dict(state_dict)
         param_update.post_process_loaded_state(self)
+        self.init_step()
 
     @property
     def supports_fused_back_pass(self):

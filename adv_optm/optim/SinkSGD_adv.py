@@ -131,6 +131,7 @@ class SinkSGD_adv(torch.optim.Optimizer):
     def load_state_dict(self, state_dict: dict) -> None:
         super().load_state_dict(state_dict)
         param_update.post_process_loaded_state(self)
+        self.init_step()
 
     @property
     def supports_fused_back_pass(self):

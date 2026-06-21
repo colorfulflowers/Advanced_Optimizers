@@ -72,6 +72,30 @@ class Prodigy_adv(torch.optim.Optimizer):
         d_limiter (bool): whether to clamp the new step size estimate (`d_hat`)
             to prevent sudden, volatile increases in the adaptive step size (`d`).
             (default: False)
+        d_limiter_warmup_steps (int): If greater than zero, activates `d_limiter`
+            implicitly and gradually relaxes its restriction over the specified
+            number of steps. At step 0 the multiplier is 0 (d_hat is fully clamped
+            to d), and at step `d_limiter_warmup_steps` the multiplier reaches 1.0
+            (equivalent to d_limiter=False). Beyond that step the restriction is
+            fully lifted. Set to 0 to use the fixed d_limiter behaviour.
+            (default: 0)
+        d_limiter_warmup_curve (str): The curve shape used to interpolate the
+            d_limiter multiplier from 0 to 1 during warmup. When passing via
+            optimizer_args (e.g. kohya-ss), wrap the value in single quotes:
+            ``d_limiter_warmup_curve='cosine'``. Options:
+            ``'cosine'``  - S-curve, slow start and end, fast middle (recommended);
+            ``'squared'`` - slow start, fast end;
+            ``'sqrt'``    - fast start, slow end;
+            ``'linear'``  - uniform increase.
+            (default: 'cosine')
+        growth_rate_steps (int): If greater than zero, disable the `growth_rate`
+            restriction after the specified number of optimizer steps, allowing
+            Prodigy's D-adaptation to update `d` freely. Unlike `prodigy_steps`,
+            this only releases the growth-rate cap — D-adaptation itself continues
+            running. Use this to apply a warmup-style growth limit for the early
+            phase of training without permanently suppressing the adaptive step size.
+            Set to 0 to keep `growth_rate` active for the entire training run.
+            (default: 0)
         kourkoutas_beta (bool): whether to enable the layer-wise dynamic β₂ logic.
             If `False`, the optimizer behaves as standard AdamW/Prodigy. (default: False)
         beta2_min (float): The minimum value for dynamic β₂, used during periods of
@@ -143,6 +167,9 @@ class Prodigy_adv(torch.optim.Optimizer):
         slice_p: int = 11,
         prodigy_steps: int = 0,
         d_limiter: bool = False,
+        d_limiter_warmup_steps: int = 0,
+        d_limiter_warmup_curve: str = "cosine",
+        growth_rate_steps: int = 0,
         # K-b (adaptive beta2)
         kourkoutas_beta: bool = False,
         beta2_min: float = 0.9,
@@ -156,6 +183,7 @@ class Prodigy_adv(torch.optim.Optimizer):
         centered_wd_mode: str = 'float8',
         # Spectral Normalization
         spectral_normalization: bool = False,
+
     ):
         if not (lr >= 0.0):
             raise ValueError(f"Learning-rate should be >= 0.0. Got {lr}")
@@ -188,6 +216,9 @@ class Prodigy_adv(torch.optim.Optimizer):
             "beta3": beta3, "d": d0, "d0": d0, "d_max": d0, "d_numerator": 0.0, "d_coef": d_coef,
             "growth_rate": growth_rate, "safeguard_warmup": safeguard_warmup, "k": 0, "slice_p": slice_p,
             "fsdp_in_use": fsdp_in_use, "prodigy_steps": prodigy_steps, "d_limiter": d_limiter,
+            "d_limiter_warmup_steps": d_limiter_warmup_steps,
+            "d_limiter_warmup_curve": d_limiter_warmup_curve,
+            "growth_rate_steps": growth_rate_steps,
             "nesterov": nesterov, "nesterov_coef": nesterov_coef, "state_precision": state_precision,
             "kourkoutas_beta": kourkoutas_beta, "beta2_min": beta2_min, "ema_alpha": ema_alpha,
             "tiny_spike": tiny_spike, "k_warmup_steps": k_warmup_steps, "k_logging": k_logging,
@@ -231,6 +262,16 @@ class Prodigy_adv(torch.optim.Optimizer):
         super().load_state_dict(state_dict)
         param_update.post_process_loaded_state(self)
         self.init_step()
+
+    def load_state_dict(self, state_dict: dict) -> None:
+        """
+        Overrides default load_state_dict to implement a workaround for PyTorch's
+        automatic dtype casting. It ensures factorized states remain float32 for
+        stability, preserves integer/float8 quantized anchor states, and forces
+        standard states onto the parameter's current dtype/device.
+        """
+        super().load_state_dict(state_dict)
+        param_update.post_process_loaded_state(self)
 
     @property
     def supports_fused_back_pass(self):
@@ -568,12 +609,41 @@ class Prodigy_adv(torch.optim.Optimizer):
             d_hat = g_group['d']
             if global_d_denom > 0:
                 d_hat = d_coef * global_d_numerator / global_d_denom
+
+                # 1. d_limiter (fixed cap on d_hat)
                 if g_group.get('d_limiter', False):
                     d_hat = min(g_group['d'] * (2 ** 0.25), d_hat)
+
+                # 2. update d_max and d (initial step handling)
                 if g_group['d'] == g_group['d0']:
                     g_group['d'] = max(g_group['d'], d_hat)
                 d_max = max(d_max, d_hat)
-                g_group['d'] = min(d_max, g_group['d'] * growth_rate)
+
+                # 3. growth_rate
+                growth_rate_steps = g_group.get('growth_rate_steps', 0)
+                effective_growth_rate = (
+                    growth_rate
+                    if (growth_rate_steps <= 0 or g_group['k'] < growth_rate_steps)
+                    else float('inf')
+                )
+                g_group['d'] = min(d_max, g_group['d'] * effective_growth_rate)
+
+                # 4. d_limiter_warmup: applied last, directly on d
+                d_limiter_warmup_steps = g_group.get('d_limiter_warmup_steps', 0)
+                if d_limiter_warmup_steps > 0:
+                    t = min(g_group['k'] + 1, d_limiter_warmup_steps)
+                    r = t / d_limiter_warmup_steps
+                    curve = g_group.get('d_limiter_warmup_curve', 'cosine')
+                    if curve == 'cosine':
+                        multiplier = (1 - math.cos(math.pi * r)) / 2
+                    elif curve == 'squared':
+                        multiplier = r * r
+                    elif curve == 'sqrt':
+                        multiplier = math.sqrt(r)
+                    else:  # linear
+                        multiplier = r
+                    d0 = g_group['d0']
+                    g_group['d'] = d0 + (g_group['d'] - d0) * multiplier
 
             for group in self.param_groups:
                 group['d_numerator'] = global_d_numerator

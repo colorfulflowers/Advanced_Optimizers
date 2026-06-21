@@ -189,9 +189,8 @@ class Adopt_adv(torch.optim.Optimizer):
             for device in devices:
                 param_update.set_seed(device)
 
-        self._compiled_step_parameter = None
-        if compiled_optimizer:
-            self.compile(fullgraph=True)
+        # Initialize compiled function (by parameter shape)
+        self._compiled_step_fns = {}
 
     def load_state_dict(self, state_dict: dict) -> None:
         """
@@ -202,6 +201,7 @@ class Adopt_adv(torch.optim.Optimizer):
         """
         super().load_state_dict(state_dict)
         param_update.post_process_loaded_state(self)
+        self.init_step()
 
     @property
     def supports_fused_back_pass(self): return True
@@ -221,22 +221,20 @@ class Adopt_adv(torch.optim.Optimizer):
 
         # State Initialization
         if 'step' not in state:
-            grad = p.grad
             state['step'] = 0
 
             req_precision = group['state_precision']
             is_vector = len(p.shape) == 1 and not group['vector_reshape']
 
             state['factored'] = req_precision == 'factored' and not is_vector
+
             state['factored_2nd'] = group.get('factored_2nd', False) and not is_vector
 
             actual_precision = 'auto' if req_precision == 'factored' else req_precision
             group['actual_state_precision'] = actual_precision
 
             dtype = torch.float32 if (state['factored'] or req_precision == 'factored') else p.dtype
-
-            vt_dtype = torch.float32 if (state['factored'] or state['factored_2nd'] or req_precision in ['factored', 'bf16_sr', 'int8_sr']) else dtype
-            vt_init = grad.pow(2).to(vt_dtype)
+            device = p.device
 
             if state['factored']:
                 state['effective_shape'] = _get_effective_shape(p.numel())
@@ -244,28 +242,29 @@ class Adopt_adv(torch.optim.Optimizer):
 
                 # First moment (m)
                 if group['betas'][0] > 0:
-                    state['mu_m_nmf'] = torch.zeros(d1, device=p.device, dtype=torch.float32)
-                    state['mv_m_nmf'] = torch.zeros(d2, device=p.device, dtype=torch.float32)
+                    state['mu_m_nmf'] = torch.zeros(d1, device=device, dtype=torch.float32)
+                    state['mv_m_nmf'] = torch.zeros(d2, device=device, dtype=torch.float32)
                     packed_d2 = (d2 + 7) // 8
-                    state['sign'] = torch.zeros((d1, packed_d2), dtype=torch.uint8, device=p.device)
-                    state['shifter'] = torch.tensor([1, 2, 4, 8, 16, 32, 64, 128], device=p.device, dtype=torch.uint8)
+                    state['sign'] = torch.zeros((d1, packed_d2), dtype=torch.uint8, device=device)
+                    state['shifter'] = torch.tensor([1, 2, 4, 8, 16, 32, 64, 128], device=device, dtype=torch.uint8)
 
                 # Second moment (v)
-                state['mu_v_nmf'], state['mv_v_nmf'] = _nnmf(vt_init.view(d1, d2))
-                del vt_init
-            else: # Fallback for non-factored tensors (or factored_2nd)
+                state['mu_v_nmf'] = torch.zeros(d1, device=device, dtype=torch.float32)
+                state['mv_v_nmf'] = torch.zeros(d2, device=device, dtype=torch.float32)
+            else:  # Fallback to standard AdamW for non-factored tensors
+                # First moment
                 if group['betas'][0] > 0:
                     init_state_tensor(state, 'exp_avg', p.shape, actual_precision, p.device, dtype)
 
+                # Second moment (v)
                 if state['factored_2nd']:
                     state['effective_shape'] = _get_effective_shape(p.numel())
                     d1, d2 = state['effective_shape']
-                    state['mu_v_nmf'], state['mv_v_nmf'] = _nnmf(vt_init.view(d1, d2))
-                    state['shifter'] = torch.tensor([1, 2, 4, 8, 16, 32, 64, 128], device=p.device, dtype=torch.uint8)
+                    state['mu_v_nmf'] = torch.zeros(d1, device=device, dtype=torch.float32)
+                    state['mv_v_nmf'] = torch.zeros(d2, device=device, dtype=torch.float32)
+                    state['shifter'] = torch.tensor([1, 2, 4, 8, 16, 32, 64, 128], device=device, dtype=torch.uint8)
                 else:
-                    init_state_tensor(state, 'exp_avg_sq', p.shape, actual_precision, p.device, dtype)
-                    set_state(state, 'exp_avg_sq', vt_init, actual_precision, None, non_neg=True)
-                del vt_init
+                    init_state_tensor(state, 'exp_avg_sq', p.shape, actual_precision, p.device, dtype, non_neg=True)
 
             if group.get('spectral_normalization', False) and is_spectral(p):
                 init_spectral_norm(state, p)
@@ -273,6 +272,20 @@ class Adopt_adv(torch.optim.Optimizer):
             _init_anchor(p, state, group)
 
             _init_fisher_wd_scaler(group, state, p)
+
+    @torch.no_grad()
+    def __init_vt(self, p, group):
+        state = self.state[p]
+        grad = p.grad
+        sp = group['actual_state_precision']
+        vt_dtype = torch.float32 if (state['factored'] or state['factored_2nd'] or sp in ['factored', 'bf16_sr', 'int8_sr']) else p.dtype
+        vt_init = grad.pow(2).to(vt_dtype)
+        if state['factored'] or state['factored_2nd']:
+            d1, d2 = state['effective_shape']
+            state['mu_v_nmf'], state['mv_v_nmf'] = _nnmf(vt_init.view(d1, d2))
+        else:
+            set_state(state, 'exp_avg_sq', vt_init, sp, None, non_neg=True)
+        del vt_init
 
     @torch.no_grad()
     def step_parameter(self, p: torch.Tensor, group: dict, i: int | None = None):
@@ -295,7 +308,8 @@ class Adopt_adv(torch.optim.Optimizer):
             # Get the dynamic beta2 calculated in prepare_step()
             beta2 = self.kourkoutas_helper.get_beta2(p, group)
 
-        current_step = state['step']
+        if state['step'] == 0:
+            self.__init_vt(p, group)
 
         # The first step is for initialization only (skip when use_atan2 as it's scale invariant).
         if state['step'] == 0 and not (self.use_atan2 or group.get('spectral_normalization', False)):
@@ -316,7 +330,15 @@ class Adopt_adv(torch.optim.Optimizer):
                 random_int_state_tensor = param_update._get_random_int_for_sr(p)
             elif group['actual_state_precision'] == 'int8_sr':
                 random_int_state_tensor = param_update._get_random_int_for_8bit_sr(p)
-            step_param_fn = self._compiled_step_parameter
+            # Cache compiled function per-shape
+            cache_key = (p.shape, state.get('factored', False))
+            if cache_key not in self._compiled_step_fns:
+                self._compiled_step_fns[cache_key] = torch.compile(
+                    self._step_parameter,
+                    fullgraph=True,
+                    dynamic=False
+                )
+            step_param_fn = self._compiled_step_fns[cache_key]
         else:
             lr = group['lr']
             step_param_fn = self._step_parameter
@@ -358,7 +380,8 @@ class Adopt_adv(torch.optim.Optimizer):
             else:
                 vt.mul_(beta2).addcmul_(grad_reshaped, grad_reshaped, value=1.0 - beta2)
             # Factorize
-            state['mu_v_nmf'], state['mv_v_nmf'] = _factorize_state(vt, signed=False, shifter=state['shifter'])
+            for key, val in zip(('mu_v_nmf', 'mv_v_nmf'), _factorize_state(vt, signed=False, shifter=state['shifter'])):
+                state[key].copy_(val)
             del vt
 
             if self.use_atan2:
@@ -376,7 +399,8 @@ class Adopt_adv(torch.optim.Optimizer):
                 mt.lerp_(normalized_grad, 1.0 - beta1)
 
                 # Factorize
-                state['mu_m_nmf'], state['mv_m_nmf'], state['sign'] = _factorize_state(mt.clone(), signed=True, shifter=state['shifter'])
+                for key, val in zip(('mu_m_nmf', 'mv_m_nmf', 'sign'), _factorize_state(mt.clone(), signed=True, shifter=state['shifter'])):
+                    state[key].copy_(val)
 
                 update_mt = mt
 
@@ -443,7 +467,8 @@ class Adopt_adv(torch.optim.Optimizer):
                 vt.mul_(beta2).addcmul_(grad_vt, grad_vt, value=1 - beta2)
 
             if factored_2nd:
-                state['mu_v_nmf'], state['mv_v_nmf'] = _factorize_state(vt.view(d1, d2), signed=False, shifter=state['shifter'])
+                for key, val in zip(('mu_v_nmf', 'mv_v_nmf'), _factorize_state(vt.view(d1, d2), signed=False, shifter=state['shifter'])):
+                    state[key].copy_(val)
             else:
                 set_state(state, 'exp_avg_sq', vt, actual_precision, random_int_state_tensor, non_neg=True)
             del random_int_state_tensor
@@ -457,9 +482,6 @@ class Adopt_adv(torch.optim.Optimizer):
 
         # Parameter Update
         param_update.apply_parameter_update(self, p, group, update, lr, random_int_tensor=random_int_tensor, wd_scaler=wd_scaler)
-
-    def compile(self, *args, **kwargs):
-        self._compiled_step_parameter = torch.compile(self._step_parameter, *args, **kwargs)
 
     @torch.no_grad()
     def step(self, closure=None):

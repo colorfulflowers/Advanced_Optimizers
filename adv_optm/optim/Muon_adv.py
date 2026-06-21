@@ -2,7 +2,7 @@ import torch
 
 from ..util import param_update
 from ..util.Muon_util import newton_schulz, _is_suitable_for_muon, rms_adjustment, normuon_update, approx_mars
-from ..util.scaled_optm import spectral_normalization, init_spectral_norm
+from ..util.scaled_optm import scale_update, init_spectral_norm
 from ..util.factorization_util import _get_effective_shape, _factorize_state, _reconstruct_state
 from ..util.OrthoGrad import _orthogonalize_gradient
 from ..util.Kourkoutas import KourkoutasHelper
@@ -81,7 +81,6 @@ class Muon_adv(torch.optim.Optimizer):
             'float8': Uses torch.float8_e4m3fn for a balance of precision and memory.
             'int8': Uses 8-bit block-wise quantization (block size 128).
             'int4': Uses 4-bit block-wise quantization (block size 32).
-        n_layers (int): The depth of the network (L). Required for optimal epsilon scaling. (default: 1)
         spectral_normalization (bool): Enable explicit spectral normalization using power iteration. (default: False)
         --- Auxiliary AdamW_adv Parameters (used for 'adam' groups) ---
         adam_betas (tuple[float, float]): Betas for the AdamW optimizer part.
@@ -146,7 +145,6 @@ class Muon_adv(torch.optim.Optimizer):
         approx_mars: bool = False,
         mars_gamma: float = 0.025,
         # Spectral Normalization
-        n_layers: int = 1,
         spectral_normalization: bool = False,
         # Centered WD
         centered_wd: float = 0.0,
@@ -186,8 +184,6 @@ class Muon_adv(torch.optim.Optimizer):
         if spectral_normalization and rms_rescaling:
             print("Warning: spectral_normalization is incompatible with rms_rescaling, Disabling rms_rescaling.")
             rms_rescaling = False
-        if spectral_normalization and accelerated_ns:
-            raise ValueError("spectral_normalization violates accelerated Newton-Schulz assumptions. Pick one of them.")
 
         # Legacy backwards compatibility support for `nnmf_factor=True`
         if nnmf_factor:
@@ -222,7 +218,7 @@ class Muon_adv(torch.optim.Optimizer):
             # MARS-M
             "approx_mars": approx_mars, "mars_gamma": mars_gamma,
             # Spectral Normalization
-            "n_layers": n_layers, "spectral_normalization": spectral_normalization,
+            "spectral_normalization": spectral_normalization,
             # Centered WD
             "centered_wd": centered_wd,
             "centered_wd_mode": centered_wd_mode,
@@ -258,11 +254,9 @@ class Muon_adv(torch.optim.Optimizer):
             for device in devices:
                 param_update.set_seed(device)
 
-        # Initialize compiled function
-        self._compiled_muon_step_parameter = None
-        self._compiled_adam_step_parameter = None
-        if compiled_optimizer:
-            self.compile(fullgraph=True)
+        # Initialize compiled functions (by parameter shape)
+        self._compiled_muon_step_fns = {}
+        self._compiled_adam_step_fns = {}
 
     def load_state_dict(self, state_dict: dict) -> None:
         """
@@ -273,6 +267,7 @@ class Muon_adv(torch.optim.Optimizer):
         """
         super().load_state_dict(state_dict)
         param_update.post_process_loaded_state(self)
+        self.init_step()
 
     @property
     def supports_fused_back_pass(self):
@@ -399,7 +394,15 @@ class Muon_adv(torch.optim.Optimizer):
             random_int_state_tensor = None
             if is_compiled:
                 step_size = torch.as_tensor(step_size)
-                adam_step_param = self._compiled_adam_step_parameter
+                # Cache compiled function per-shape
+                cache_key = (p.shape, state.get('factored', False))
+                if cache_key not in self._compiled_adam_step_fns:
+                    self._compiled_adam_step_fns[cache_key] = torch.compile(
+                        Muon_AuxAdam._adam_step_parameter,
+                        fullgraph=True,
+                        dynamic=False
+                    )
+                adam_step_param = self._compiled_adam_step_fns[cache_key]
                 
                 actual_precision = group.get('adam_actual_state_precision', 'auto')
                 random_int_state_tensor = random_int_tensor
@@ -415,9 +418,18 @@ class Muon_adv(torch.optim.Optimizer):
             state['step'] += 1
 
         else: # Muon path
+            random_G_sketch = None
             if is_compiled:
                 lr = torch.as_tensor(group['lr'])
-                muon_step_param = self._compiled_muon_step_parameter
+                # Cache compiled function per-shape
+                cache_key = (p.shape, state.get('factored', False))
+                if cache_key not in self._compiled_muon_step_fns:
+                    self._compiled_muon_step_fns[cache_key] = torch.compile(
+                        self._muon_step_parameter,
+                        fullgraph=True,
+                        dynamic=False
+                    )
+                muon_step_param = self._compiled_muon_step_fns[cache_key]
 
                 # Generate state SR random tensor when compiled
                 actual_precision = group['actual_state_precision']
@@ -431,14 +443,9 @@ class Muon_adv(torch.optim.Optimizer):
             else:
                 lr = group['lr']
                 random_int_state_tensor = None
-                random_G_sketch = None
                 muon_step_param = self._muon_step_parameter
 
             muon_step_param(p, grad, state, group, lr, random_int_tensor, random_int_state_tensor, random_G_sketch)
-
-    def compile(self, *args, **kwargs):
-        self._compiled_muon_step_parameter = torch.compile(self._muon_step_parameter, *args, **kwargs)
-        self._compiled_adam_step_parameter = torch.compile(Muon_AuxAdam._adam_step_parameter, *args, **kwargs)
 
     @torch.no_grad()
     def _muon_step_parameter(self, p, grad, state, group, lr, random_int_tensor, random_int_state_tensor, random_G_sketch):
@@ -478,8 +485,9 @@ class Muon_adv(torch.optim.Optimizer):
                 # Standard momentum
                 update = mt_buf.clone()
 
-            # Factorize
-            state['mu_mbuf_nmf'], state['mv_mbuf_nmf'], state['sign_buf'] = _factorize_state(mt_buf, signed=True, shifter=state['shifter'])
+            # Compress new momentum and store factors
+            for key, val in zip(('mu_mbuf_nmf', 'mv_mbuf_nmf', 'sign_buf'), _factorize_state(mt_buf, signed=True, shifter=state['shifter'])):
+                state[key].copy_(val)
             del mt_buf
 
             # Orthogonalization step
@@ -545,7 +553,7 @@ class Muon_adv(torch.optim.Optimizer):
 
             if group.get('spectral_normalization', False):
                 # Spectral Normalization
-                spectral_normalization(update, state['spectral_u'], state['spectral_v'], lr)
+                scale_update(p, update, lr, state)
             else:
                 # RMS-aligned rescaling
                 rms_adjustment(update, group['rms_rescaling'], lr)

@@ -121,6 +121,7 @@ class SignSGD_adv(torch.optim.Optimizer):
             centered_wd_mode= centered_wd_mode,
             state_precision=state_precision,
             nnmf_factor=nnmf_factor,
+            compiled_optimizer=compiled_optimizer,
         )
         self.stochastic_rounding = stochastic_rounding
         self._init_lr = lr if lr > 0 else 1
@@ -135,10 +136,8 @@ class SignSGD_adv(torch.optim.Optimizer):
             for device in devices:
                 param_update.set_seed(device)
 
-        # Initialize compiled function
-        self._compiled_step_parameter = None
-        if compiled_optimizer:
-            self.compile(fullgraph=True)
+        # Initialize compiled function (by parameter shape)
+        self._compiled_step_fns = {}
 
     def load_state_dict(self, state_dict: dict) -> None:
         """
@@ -149,6 +148,7 @@ class SignSGD_adv(torch.optim.Optimizer):
         """
         super().load_state_dict(state_dict)
         param_update.post_process_loaded_state(self)
+        self.init_step()
 
     @property
     def supports_fused_back_pass(self) -> bool:
@@ -235,7 +235,16 @@ class SignSGD_adv(torch.optim.Optimizer):
                 random_noise_tensor = param_update._get_random_noise_for_sso(p)
 
             lr = torch.as_tensor(lr)
-            step_param_fn = self._compiled_step_parameter
+
+            # Cache compiled function per-shape
+            cache_key = (p.shape, state.get('factored', False))
+            if cache_key not in self._compiled_step_fns:
+                self._compiled_step_fns[cache_key] = torch.compile(
+                    self._step_parameter,
+                    fullgraph=True,
+                    dynamic=False
+                )
+            step_param_fn = self._compiled_step_fns[cache_key]
         else:
             step_param_fn = self._step_parameter
 
@@ -295,7 +304,8 @@ class SignSGD_adv(torch.optim.Optimizer):
                     raw_update = exp_avg.clone()
 
                 # Compress new momentum m_t and store factors
-                state['mu_m_nmf'], state['mv_m_nmf'], state['sign'] = _factorize_state(exp_avg, signed=True, shifter=state['shifter'])
+                for key, val in zip(('mu_m_nmf', 'mv_m_nmf', 'sign'), _factorize_state(exp_avg, signed=True, shifter=state['shifter'])):
+                    state[key].copy_(val)
             else:
                 raw_update = grad_reshaped.clone()
 
@@ -355,9 +365,6 @@ class SignSGD_adv(torch.optim.Optimizer):
             update.mul_(update_scaling)
 
         param_update.apply_parameter_update(self, p, group, update, lr, random_int_tensor=random_int_tensor, wd_target=wd_target, cwd_target=cwd_target)
-
-    def compile(self, *args, **kwargs):
-        self._compiled_step_parameter = torch.compile(self._step_parameter, *args, **kwargs)
 
     @torch.no_grad()
     def step(self, closure: Optional[callable] = None):

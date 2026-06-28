@@ -114,7 +114,7 @@ def init_spectral_norm(state: dict, p: torch.Tensor):
     if getattr(p, '_is_oft', False):
         n_el = p.shape[-1]
         b = int((1.0 + math.sqrt(1.0 + 8.0 * n_el)) / 2.0)
-        _, _, _ = get_cached_structural_tensors(b, p.dtype, p.device)
+        get_cached_structural_tensors(b, p.device)
         gen = param_update.get_generator(p.device)
         batch_size = p.numel() // n_el
         # Initialize v (Right singular vector)

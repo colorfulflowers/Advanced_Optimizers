@@ -43,7 +43,7 @@ def iterative_ortho_project(p: torch.Tensor, grad: torch.Tensor, iters: int = 3)
     # 1D Vector Case fallback to the standard OrthoGrad
     is_vector = p.ndim < 2 or getattr(p, '_is_dora_scale', False) or getattr(p, 'is_vector', False)
     if is_vector:
-        return _orthogonalize_gradient(p, grad)
+        return flattened_ortho_project(p, grad)
 
     original_shape = grad.shape
 

@@ -7,14 +7,14 @@ import math
 _OFT_INDICES_CACHE = {}
 _OFT_IDENTITY_CACHE = {}
 
-def get_cached_structural_tensors(b: int, dtype: torch.dtype, device: torch.device):
+def get_cached_structural_tensors(b: int, device: torch.device):
     """
-    Retrieves or creates structural tensors (indices and Identity) for OFT exact geometry.
+    Retrieves or creates structural tensors (indices) for OFT exact geometry.
     Caches them globally to prevent redundant memory allocation across thousands of layers.
     """
-    global _OFT_INDICES_CACHE, _OFT_IDENTITY_CACHE
+    global _OFT_INDICES_CACHE
 
-    # Cache for Indices (Dtype independent, only depends on block size and device)
+    # Cache for Indices
     idx_key = (b, device)
     if idx_key not in _OFT_INDICES_CACHE:
         rows, cols = torch.triu_indices(b, b, 1, device=device)
@@ -22,15 +22,8 @@ def get_cached_structural_tensors(b: int, dtype: torch.dtype, device: torch.devi
     else:
         rows, cols = _OFT_INDICES_CACHE[idx_key]
 
-    # Cache for Identity Matrix (Depends on block size, dtype, and device)
-    id_key = (b, dtype, device)
-    if id_key not in _OFT_IDENTITY_CACHE:
-        I = torch.eye(b, dtype=dtype, device=device).unsqueeze(0)
-        _OFT_IDENTITY_CACHE[id_key] = I
-    else:
-        I = _OFT_IDENTITY_CACHE[id_key]
 
-    return rows, cols, I
+    return rows, cols
 
 def scale_update(
     p: torch.Tensor,
@@ -59,7 +52,7 @@ def scale_update(
         return max_abs_normalization(update, dim=None, lr=lr)
 
     # OFT Block Parameters: shape (k, C(b,2))
-    # Direct spectral normalization on the skew-symmetric blocks, followed by Riemannian preconditioning.
+    # Direct spectral normalization on the skew-symmetric blocks.
     if is_oft:
         return apply_spectral_riemannian_oft(p, update, lr, state)
 
@@ -121,7 +114,7 @@ def init_spectral_norm(state: dict, p: torch.Tensor):
     if getattr(p, '_is_oft', False):
         n_el = p.shape[-1]
         b = int((1.0 + math.sqrt(1.0 + 8.0 * n_el)) / 2.0)
-        _, _, _ = get_cached_structural_tensors(b, p.dtype, p.device)
+        get_cached_structural_tensors(b, p.device)
         gen = param_update.get_generator(p.device)
         batch_size = p.numel() // n_el
         # Initialize v (Right singular vector)
@@ -176,33 +169,25 @@ def apply_spectral_riemannian_oft(
     state: dict
 ) -> torch.Tensor:
     """
-    Applies Spectral Normalization directly on the skew-symmetric gradient,
-    then uses True Matrix Preconditioning: M @ G @ M where M = (I - Q^2).
-    Neutralizes the derivative shrinkage of the Cayley transform.
+    Applies Spectral Normalization directly on the skew-symmetric gradient.
     """
     n_el = p.shape[-1]
     block_size = int((1 + math.sqrt(1 + 8 * n_el)) / 2)
     device, dtype = p.device, p.dtype
-    rows, cols, I = get_cached_structural_tensors(block_size, dtype, device)
+    rows, cols = get_cached_structural_tensors(block_size, device)
 
     # Flatten any prepended batch dimensions for processing
     orig_shape = p.shape
 
     # Align the scale of p with the forward pass
     scale_factor = getattr(p, '_oft_scale_factor', 1.0)
-    p_flat = p.view(-1, n_el) / scale_factor
 
     update_flat = update.view(-1, n_el)
-    batch_size = p_flat.shape[0]
+    batch_size = update_flat.shape[0]
 
     # Initialize matrices
-    Q = torch.zeros(batch_size, block_size, block_size, device=device, dtype=dtype)
     G = torch.zeros(batch_size, block_size, block_size, device=device, dtype=dtype)
     batch_idx = torch.arange(batch_size, device=device)[:, None]
-
-    # Construct skew-symmetric parameter matrix Q
-    Q = Q.index_put((batch_idx, rows, cols), p_flat)
-    Q = Q - Q.transpose(-2, -1)
 
     # Construct skew-symmetric gradient matrix G
     G = G.index_put((batch_idx, rows, cols), update_flat)
@@ -228,28 +213,16 @@ def apply_spectral_riemannian_oft(
     # Estimate sigma (The spectral norm) for each block
     sigma = torch.sum(next_u * u_raw, dim=1, keepdim=True)
 
-    # We constrain the spectral norm of the entire block-diagonal update matrix
-    # which is the maximum of the spectral norms of its blocks.
-    max_sigma = sigma.max()
+    # Squeeze out the last dimension so shape becomes (batch_size, 1)
+    sigma = sigma.squeeze(-1) 
 
     target_scale = 0.5 * scale_factor
     spectral_eps = 1.0 / (2.0 * math.sqrt(block_size))
 
-    # Rescale G
-    scale = lr * (target_scale / max_sigma.clamp_min(spectral_eps))
-    G = G * scale
+    # Apply the clamp and scaling block-wise
+    scale = lr * (target_scale / sigma.clamp_min(spectral_eps))
 
-    # Apply Riemannian Preconditioning
-    # Compute True Matrix Preconditioner M = I - Q^2
-    M = I - torch.bmm(Q, Q)
-
-    # Apply exact preconditioning: G_prec = M @ G @ M
-    G_prec = torch.bmm(torch.bmm(M, G), M)
-
-    # Extract the preconditioned upper-triangular elements
-    update_prec_flat = G_prec[batch_idx, rows, cols]
-
-    return update_prec_flat.view(orig_shape)
+    return update_flat.mul_(scale).view(orig_shape)
 
 
 @torch.no_grad()
